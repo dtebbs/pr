@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Test stub for `gh`. Behaviour:
+- Always handles `gh repo view --json nameWithOwner -q .nameWithOwner` and
+  `gh repo view --json defaultBranchRef -q .defaultBranchRef.name` from env
+  (PR_TEST_REPO, PR_TEST_DEFAULT_BRANCH).
+- For everything else, looks up a fixture in $PR_TEST_FIXTURE_DIR keyed by a
+  hash of argv. Each fixture file is JSON: {"stdout": "...", "stderr": "...",
+  "exit": 0}. If PR_TEST_FIXTURE_DIR is unset or the fixture is missing, exits
+  non-zero with a message naming the missing key.
+"""
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+
+
+def _emit_repo_view():
+    if argv[:2] != ["repo", "view"]:
+        return False
+    if "-q" not in argv:
+        return False
+    q = argv[argv.index("-q") + 1]
+    if q == ".nameWithOwner":
+        sys.stdout.write(os.environ.get("PR_TEST_REPO", "test/repo") + "\n")
+        return True
+    if q == ".defaultBranchRef.name":
+        sys.stdout.write(os.environ.get("PR_TEST_DEFAULT_BRANCH", "main") + "\n")
+        return True
+    return False
+
+
+def _replay():
+    fixture_dir = os.environ.get("PR_TEST_FIXTURE_DIR")
+    if not fixture_dir:
+        sys.stderr.write(f"fake_gh: no PR_TEST_FIXTURE_DIR set, can't replay: {argv}\n")
+        sys.exit(2)
+    key = hashlib.sha256(json.dumps(argv).encode()).hexdigest()[:16]
+    path = Path(fixture_dir) / f"{key}.json"
+    if not path.exists():
+        sys.stderr.write(f"fake_gh: missing fixture {path} for argv={argv}\n")
+        sys.exit(2)
+    data = json.loads(path.read_text())
+    sys.stdout.write(data.get("stdout", ""))
+    sys.stderr.write(data.get("stderr", ""))
+    sys.exit(int(data.get("exit", 0)))
+
+
+if _emit_repo_view():
+    sys.exit(0)
+_replay()

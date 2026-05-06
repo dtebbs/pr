@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""pr — stacked-PR manager. See README in this dir."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+STATE_PATH = Path.home() / ".pr.json"
+CONFIG_PATH = Path.home() / ".config" / "pr" / "config.json"
+DEFAULT_RETENTION_HOURS = 24
+STATE_VERSION = 1
+DEP_PREFIX_RE = re.compile(r"^\[dep #\d+\] ?")
+
+
+class CmdError(RuntimeError):
+    pass
+
+
+def die(msg: str, code: int = 1):
+    print(f"pr: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(cmd, capture_output=capture, text=True)
+    if check and proc.returncode != 0:
+        stderr = (proc.stderr or "").strip() if capture else ""
+        raise CmdError(f"{' '.join(cmd)} failed (exit {proc.returncode}){': ' + stderr if stderr else ''}")
+    return proc
+
+
+def git(*args: str, check: bool = True, capture: bool = True) -> str:
+    proc = run(["git", *args], check=check, capture=capture)
+    return proc.stdout.rstrip() if capture else ""
+
+
+def gh(*args: str, check: bool = True, capture: bool = True) -> str:
+    proc = run(["gh", *args], check=check, capture=capture)
+    return proc.stdout.rstrip() if capture else ""
+
+
+def gh_json(args: list[str], fields: list[str]) -> object:
+    raw = gh(*args, "--json", ",".join(fields))
+    return json.loads(raw or "null")
+
+
+def require_keys(obj: dict, keys: list[str], context: str):
+    missing = [k for k in keys if k not in obj]
+    extra = [k for k in obj if k not in keys]
+    if missing or extra:
+        raise CmdError(f"gh JSON shape mismatch [{context}]: missing={missing} extra={extra}")
+
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {"version": STATE_VERSION, "trees": {}}
+    data = json.loads(STATE_PATH.read_text())
+    if data.get("version") != STATE_VERSION:
+        die(f"state file {STATE_PATH} has unknown version {data.get('version')}")
+    return data
+
+
+def save_state(state: dict):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def tree_state(state: dict, tree: str) -> dict:
+    return state["trees"].setdefault(tree, {"branches": {}})
+
+
+def load_config() -> dict:
+    cfg = {"closed_retention_hours": DEFAULT_RETENTION_HOURS}
+    if CONFIG_PATH.exists():
+        try:
+            user = json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError:
+            print(f"pr: warning: {CONFIG_PATH} is malformed; using defaults", file=sys.stderr)
+            return cfg
+        if isinstance(user, dict):
+            cfg.update(user)
+    return cfg
+
+
+def current_branch() -> str:
+    return git("symbolic-ref", "--short", "HEAD")
+
+
+def current_tree() -> str:
+    return git("rev-parse", "--show-toplevel")
+
+
+def current_user_login() -> str:
+    return gh("api", "user", "--jq", ".login")
+
+
+def default_branch() -> str:
+    return gh("repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+
+
+def needs_rebase(branch: str, dep: str | None, db: str) -> str:
+    target = dep if dep is not None else db
+    try:
+        dep_tip = git("rev-parse", f"origin/{target}")
+    except CmdError:
+        return "?"
+    try:
+        branch_tip = git("rev-parse", f"refs/heads/{branch}")
+    except CmdError:
+        try:
+            branch_tip = git("rev-parse", f"origin/{branch}")
+        except CmdError:
+            return "(no local)"
+    try:
+        mb = git("merge-base", dep_tip, branch_tip)
+    except CmdError:
+        return "?"
+    return "ok" if mb == dep_tip else "needs-rebase"
+
+
+def fmt_status(entry: dict) -> str:
+    return entry["status"].upper()
+
+
+def fmt_pr(entry: dict) -> str:
+    return f"#{entry['pr']}" if entry["pr"] is not None else "-"
+
+
+def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
+    if not visible:
+        return ["no open tracked branches"]
+    children: dict[str, list[str]] = {}
+    for name, e in visible.items():
+        parent = db if e["depends_on"] is None else e["depends_on"]
+        children.setdefault(parent, []).append(name)
+    for v in children.values():
+        v.sort()
+    lines = [db]
+    for i, name in enumerate(children.get(db, [])):
+        _render_lines(lines, name, children, visible, prefix="",
+                      is_last=(i == len(children[db]) - 1),
+                      rebase_fn=rebase_fn)
+    externals = sorted(set(children) - {db} - set(visible))
+    for ext in externals:
+        lines.append(f"<external: {ext}>")
+        kids = children[ext]
+        for i, name in enumerate(kids):
+            _render_lines(lines, name, children, visible, prefix="",
+                          is_last=(i == len(kids) - 1),
+                          rebase_fn=rebase_fn)
+    return lines
+
+
+def _render_lines(lines, name, children, visible, *, prefix, is_last, rebase_fn):
+    glyph = "└── " if is_last else "├── "
+    entry = visible[name]
+    rebase = rebase_fn(name, entry["depends_on"])
+    row = f"{name}  {fmt_pr(entry)}  {fmt_status(entry)}  {rebase}"
+    if entry.get("external"):
+        row += "  (external)"
+    lines.append(f"{prefix}{glyph}{row}")
+    kids = children.get(name, [])
+    new_prefix = prefix + ("    " if is_last else "│   ")
+    for i, child in enumerate(kids):
+        _render_lines(lines, child, children, visible, prefix=new_prefix,
+                      is_last=(i == len(kids) - 1), rebase_fn=rebase_fn)
+
+
+def cmd_show(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    if not rs["branches"]:
+        print("no tracked branches")
+        return
+    db = default_branch()
+    visible = {
+        n: e for n, e in rs["branches"].items()
+        if args.all or e.get("status") not in ("merged", "closed")
+    }
+    rb = lambda name, dep: needs_rebase(name, dep, db)
+    for line in render_tree(visible, db, rb):
+        print(line)
+
+
+def cmd_branch(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    if args.name in rs["branches"]:
+        die(f"branch {args.name} already tracked in state")
+    cur = current_branch()
+    dep = None if args.main else cur
+    git("checkout", "-b", args.name, capture=False)
+    rs["branches"][args.name] = {
+        "pr": None,
+        "depends_on": dep,
+        "status": "no-pr",
+        "closed_at": None,
+    }
+    save_state(state)
+    print(f"branch {args.name} tracked (dep: {dep or '<default>'})")
+
+
+def _do_fetch(state: dict, rs: dict, cfg: dict):
+    git("fetch", "--all", "--prune", capture=False)
+    db = default_branch()
+
+    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author"]
+    discovered = gh_json(
+        ["pr", "list", "--state", "open", "--limit", "1000"],
+        list_fields,
+    )
+    if not isinstance(discovered, list):
+        raise CmdError(f"gh pr list returned non-list: {discovered!r}")
+    me = current_user_login()
+    for pr in discovered:
+        require_keys(pr, list_fields, "gh pr list")
+        head = pr["headRefName"]
+        if head not in rs["branches"]:
+            base = pr["baseRefName"]
+            author = pr["author"] or {}
+            login = author.get("login") if isinstance(author, dict) else None
+            rs["branches"][head] = {
+                "pr": pr["number"],
+                "depends_on": None if base == db else base,
+                "status": pr["state"].lower(),
+                "closed_at": pr["closedAt"],
+                "external": login != me,
+            }
+
+    view_fields = ["state", "baseRefName", "closedAt"]
+    for name, entry in list(rs["branches"].items()):
+        if entry["pr"] is None:
+            continue
+        try:
+            data = gh_json(["pr", "view", str(entry["pr"])], view_fields)
+        except CmdError as e:
+            print(f"pr: warning: gh pr view {entry['pr']}: {e}", file=sys.stderr)
+            continue
+        if not isinstance(data, dict):
+            raise CmdError(f"gh pr view returned non-dict: {data!r}")
+        require_keys(data, view_fields, "gh pr view")
+        st = data["state"].lower()
+        entry["status"] = st
+        base = data["baseRefName"]
+        entry["depends_on"] = None if base == db else base
+        if st in ("merged", "closed"):
+            entry["closed_at"] = data["closedAt"]
+        else:
+            entry["closed_at"] = None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg["closed_retention_hours"])
+    to_drop: list[str] = []
+    for name, entry in rs["branches"].items():
+        if entry["pr"] is None:
+            continue
+        if entry["status"] in ("merged", "closed") and entry["closed_at"]:
+            if parse_iso(entry["closed_at"]) <= cutoff:
+                to_drop.append(name)
+    for name in to_drop:
+        del rs["branches"][name]
+
+
+def cmd_fetch(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cfg = load_config()
+    _do_fetch(state, rs, cfg)
+    save_state(state)
+
+
+def cmd_create(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cfg = load_config()
+    _do_fetch(state, rs, cfg)
+
+    cur = current_branch()
+    existing = rs["branches"].get(cur)
+    if existing and existing["pr"] is not None:
+        die(f"current branch {cur} already has PR #{existing['pr']}")
+
+    if args.dep is not None:
+        dep = args.dep
+    elif existing:
+        dep = existing["depends_on"]
+    else:
+        dep = None
+
+    dep_pr = None
+    if dep is not None:
+        dep_entry = rs["branches"].get(dep)
+        if not dep_entry or dep_entry.get("pr") is None or dep_entry.get("status") != "open":
+            die(f"dep branch {dep!r} has no open PR — create its PR first")
+        dep_pr = dep_entry["pr"]
+
+    title = f"[dep #{dep_pr}] {args.message}" if dep_pr is not None else args.message
+
+    git("push", "-u", "origin", cur, capture=False)
+
+    db = default_branch()
+    base = dep if dep is not None else db
+
+    create_args = ["pr", "create", "--base", base, "--title", title, "--body", ""]
+    if not args.ready:
+        create_args.append("--draft")
+    out = gh(*create_args)
+    m = re.search(r"/pull/(\d+)", out)
+    if not m:
+        die(f"could not parse PR number from gh pr create output: {out!r}")
+    pr_num = int(m.group(1))
+
+    rs["branches"][cur] = {
+        "pr": pr_num,
+        "depends_on": dep,
+        "status": "open",
+        "closed_at": None,
+    }
+    save_state(state)
+    print(f"created PR #{pr_num}: {title}")
+
+
+def cmd_target(args):
+    if not args.main and not args.branch:
+        die("specify a branch name or --main")
+    if args.main and args.branch:
+        die("--main and a branch name are mutually exclusive")
+
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cur = current_branch()
+    entry = rs["branches"].get(cur)
+    if not entry or entry.get("pr") is None:
+        die(f"no open PR for current branch {cur} — use `pr create`")
+    if entry.get("status") != "open":
+        die(f"PR #{entry['pr']} is not open (status={entry['status']})")
+
+    new_dep = None if args.main else args.branch
+    new_dep_pr = None
+    if new_dep is not None:
+        dep_entry = rs["branches"].get(new_dep)
+        if not dep_entry or dep_entry.get("pr") is None or dep_entry.get("status") != "open":
+            die(f"target branch {new_dep!r} has no open PR")
+        new_dep_pr = dep_entry["pr"]
+
+    db = default_branch()
+    new_base = new_dep if new_dep is not None else db
+
+    gh("pr", "edit", str(entry["pr"]), "--base", new_base)
+
+    cur_title = gh("pr", "view", str(entry["pr"]), "--json", "title", "-q", ".title")
+    stripped = DEP_PREFIX_RE.sub("", cur_title)
+    new_title = f"[dep #{new_dep_pr}] {stripped}" if new_dep_pr is not None else stripped
+    if new_title != cur_title:
+        gh("pr", "edit", str(entry["pr"]), "--title", new_title)
+
+    entry["depends_on"] = new_dep
+    save_state(state)
+
+    if needs_rebase(cur, new_dep, db) == "needs-rebase":
+        print("note: branch needs rebase onto new dep — run `pr rebase`")
+
+
+def cmd_rebase(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cur = current_branch()
+    entry = rs["branches"].get(cur)
+    if not entry:
+        die(f"no state entry for {cur} — use `pr branch` or `pr create` first")
+    db = default_branch()
+    target = entry["depends_on"] if entry["depends_on"] is not None else db
+    subprocess.run(["git", "rebase", "-i", f"origin/{target}"]).check_returncode()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="pr", description="stacked-PR manager")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("show", help="display the PR tree (default)")
+    s.add_argument("--all", action="store_true", help="include merged/closed PRs")
+
+    b = sub.add_parser("branch", help="create a tracked branch with a dep")
+    b.add_argument("name")
+    b.add_argument("--main", action="store_true", help="depend on default branch instead of current")
+
+    c = sub.add_parser("create", help="open a PR for the current branch")
+    c.add_argument("-m", "--message", required=True, help="PR title")
+    c.add_argument("--dep", help="explicit dep branch (overrides state)")
+    c.add_argument("--ready", action="store_true", help="create as ready (default is draft)")
+
+    sub.add_parser("fetch", help="refresh PR state from GitHub")
+
+    t = sub.add_parser("target", help="retarget current branch's PR to a different dep")
+    t.add_argument("branch", nargs="?")
+    t.add_argument("--main", action="store_true")
+
+    sub.add_parser("rebase", help="rebase current branch onto its dep")
+
+    return p
+
+
+def main(argv: list[str] | None = None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd is None:
+        args = parser.parse_args(["show"])
+    handlers = {
+        "show": cmd_show,
+        "branch": cmd_branch,
+        "create": cmd_create,
+        "fetch": cmd_fetch,
+        "target": cmd_target,
+        "rebase": cmd_rebase,
+    }
+    try:
+        handlers[args.cmd](args)
+    except CmdError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
