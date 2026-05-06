@@ -48,26 +48,16 @@ def test_external_dep_synthetic_header():
     assert any("[feature]" in l and "#10" in l for l in lines)
 
 
-def test_tracked_external_renders_inline_with_ext_tag():
+def test_tracked_external_renders_inline_no_ext_marker():
     visible = {
         "someones-branch": {"pr": 10, "depends_on": None, "status": "open", "closed_at": None, "external": True},
         "feature": make_entry(pr_num=11, dep="someones-branch"),
     }
     lines = pr.render_tree(visible, "main", fake_rebase)
     assert not any("<external:" in l for l in lines)
-    sb = next(l for l in lines if "[someones-branch]" in l)
-    feat = next(l for l in lines if "[feature]" in l)
-    assert "(ext)" in sb
-    assert "(ext)" not in feat
-
-
-def test_ext_tag_appears_after_pr_number():
-    visible = {
-        "x": {"pr": 10, "depends_on": None, "status": "open", "closed_at": None, "external": True},
-    }
-    lines = pr.render_tree(visible, "main", fake_rebase)
-    row = lines[1]
-    assert row.index("#10") < row.index("(ext)") < row.index("ok")
+    assert not any("(ext" in l for l in lines)
+    assert any("[someones-branch]" in l for l in lines)
+    assert any("[feature]" in l for l in lines)
 
 
 def test_columns_are_aligned():
@@ -128,3 +118,29 @@ def test_render_does_not_show_open_status():
     lines = pr.render_tree(visible, "main", fake_rebase)
     assert "OPEN" not in lines[1]
     assert "NO-PR" not in lines[1]
+
+
+def test_render_ci_pass_shows_green_tick():
+    visible = {"a": {**make_entry(pr_num=1, dep=None), "ci": "pass"}}
+    lines = pr.render_tree(visible, "main", fake_rebase)
+    assert "✓" in lines[1]
+
+
+def test_render_ci_fail_shows_red_cross():
+    visible = {"a": {**make_entry(pr_num=1, dep=None), "ci": "fail"}}
+    lines = pr.render_tree(visible, "main", fake_rebase)
+    assert "✗" in lines[1]
+
+
+def test_render_ci_pending_shows_question_mark():
+    visible = {"a": {**make_entry(pr_num=1, dep=None), "ci": "pending"}}
+    lines = pr.render_tree(visible, "main", fake_rebase)
+    assert "?" in lines[1]
+
+
+def test_render_ci_none_shows_no_icon():
+    visible = {"a": {**make_entry(pr_num=1, dep=None), "ci": "none"}}
+    lines = pr.render_tree(visible, "main", fake_rebase)
+    assert "✓" not in lines[1]
+    assert "✗" not in lines[1]
+    assert "?" not in lines[1]

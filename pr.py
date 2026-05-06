@@ -134,10 +134,38 @@ def fmt_pr(entry: dict) -> str:
     return f"#{entry['pr']}" if entry["pr"] is not None else "-"
 
 
+_CI_FAIL_CONCLUSIONS = {"FAILURE", "CANCELLED", "ACTION_REQUIRED", "TIMED_OUT", "STARTUP_FAILURE", "ERROR"}
+_CI_PENDING_STATUSES = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"}
+
+
+def _summarize_checks(rollup) -> str:
+    if not rollup:
+        return "none"
+    has_fail = False
+    has_pending = False
+    for c in rollup:
+        if not isinstance(c, dict):
+            continue
+        # CheckRun: has status + conclusion. StatusContext: has state.
+        status = (c.get("status") or "").upper()
+        conclusion = (c.get("conclusion") or "").upper()
+        state = (c.get("state") or "").upper()
+        if conclusion in _CI_FAIL_CONCLUSIONS or state in {"FAILURE", "ERROR"}:
+            has_fail = True
+        elif status in _CI_PENDING_STATUSES or state in {"PENDING", "EXPECTED"}:
+            has_pending = True
+    if has_fail:
+        return "fail"
+    if has_pending:
+        return "pending"
+    return "pass"
+
+
 _ANSI_RED = "31"
 _ANSI_YELLOW = "33"
 _ANSI_GREEN = "32"
 _ANSI_ORANGE = "38;5;208"
+_ANSI_WHITE = "37"
 
 
 def _ansi(text: str, code: str) -> str:
@@ -170,8 +198,9 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
         rows_out.append({
             "lead": prefix + ("└─ " if is_last else "├─ "),
             "name": f"[{name}]",
+            "external": bool(entry.get("external")),
             "pr": fmt_pr(entry),
-            "ext": "(ext)" if entry.get("external") else "",
+            "ci": entry.get("ci") or "none",
             "rebase": rebase,
             "title": DEP_PREFIX_RE.sub("", entry.get("title") or ""),
         })
@@ -198,17 +227,26 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
 
     all_rows = [r for _, rs in groups for r in rs]
     max_lead_name = max((len(r["lead"]) + len(r["name"]) for r in all_rows), default=0)
-    widths = {c: max((len(r[c]) for r in all_rows), default=0) for c in ("pr", "ext", "rebase")}
+    widths = {c: max((len(r[c]) for r in all_rows), default=0) for c in ("pr", "rebase")}
+
+    def _ci_icon(ci: str) -> str:
+        if ci == "pass":
+            return _ansi("✓", _ANSI_GREEN)
+        if ci == "fail":
+            return _ansi("✗", _ANSI_RED)
+        if ci == "pending":
+            return _ansi("?", _ANSI_YELLOW)
+        return " "
 
     def _format(r: dict) -> str:
+        name_color = _ANSI_WHITE if r["external"] else _ANSI_RED
         parts = [
             r["lead"],
-            _ansi(r["name"], _ANSI_RED),
+            _ansi(r["name"], name_color),
             " " * (max_lead_name - len(r["lead"]) - len(r["name"])),
         ]
         parts.append("  " + _ansi(r["pr"], _ANSI_YELLOW) + " " * (widths["pr"] - len(r["pr"])))
-        if widths["ext"] > 0:
-            parts.append("  " + r["ext"] + " " * (widths["ext"] - len(r["ext"])))
+        parts.append("  " + _ci_icon(r["ci"]))
         parts.append("  " + _color_rebase(r["rebase"]) + " " * (widths["rebase"] - len(r["rebase"])))
         if r["title"]:
             parts.append("  " + r["title"])
@@ -262,7 +300,7 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
     git("fetch", "--all", "--prune", capture=False)
     db = default_branch()
 
-    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author", "title"]
+    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author", "title", "statusCheckRollup"]
     discovered = gh_json(
         ["pr", "list", "--state", "open", "--limit", "1000"],
         list_fields,
@@ -284,9 +322,10 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
                 "closed_at": pr["closedAt"],
                 "external": login != me,
                 "title": pr["title"],
+                "ci": _summarize_checks(pr["statusCheckRollup"]),
             }
 
-    view_fields = ["state", "baseRefName", "closedAt", "title"]
+    view_fields = ["state", "baseRefName", "closedAt", "title", "statusCheckRollup"]
     for name, entry in list(rs["branches"].items()):
         if entry["pr"] is None:
             continue
@@ -303,6 +342,7 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
         base = data["baseRefName"]
         entry["depends_on"] = None if base == db else base
         entry["title"] = data["title"]
+        entry["ci"] = _summarize_checks(data["statusCheckRollup"])
         if st in ("merged", "closed"):
             entry["closed_at"] = data["closedAt"]
         else:

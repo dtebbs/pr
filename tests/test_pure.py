@@ -29,3 +29,42 @@ def test_fmt_pr():
     assert pr.fmt_pr({"pr": None}) == "-"
 
 
+def test_summarize_checks_empty_is_none():
+    assert pr._summarize_checks([]) == "none"
+    assert pr._summarize_checks(None) == "none"
+
+
+def test_summarize_checks_all_success_is_pass():
+    assert pr._summarize_checks([
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "COMPLETED", "conclusion": "SKIPPED"},
+    ]) == "pass"
+
+
+def test_summarize_checks_any_failure_is_fail():
+    assert pr._summarize_checks([
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "COMPLETED", "conclusion": "FAILURE"},
+    ]) == "fail"
+
+
+def test_summarize_checks_any_pending_without_failure_is_pending():
+    assert pr._summarize_checks([
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "IN_PROGRESS", "conclusion": None},
+    ]) == "pending"
+
+
+def test_summarize_checks_failure_dominates_pending():
+    assert pr._summarize_checks([
+        {"status": "IN_PROGRESS", "conclusion": None},
+        {"status": "COMPLETED", "conclusion": "FAILURE"},
+    ]) == "fail"
+
+
+def test_summarize_checks_status_context_shape():
+    assert pr._summarize_checks([{"state": "FAILURE"}]) == "fail"
+    assert pr._summarize_checks([{"state": "PENDING"}]) == "pending"
+    assert pr._summarize_checks([{"state": "SUCCESS"}]) == "pass"
+
+
