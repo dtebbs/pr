@@ -283,6 +283,20 @@ def cmd_fetch(args):
     save_state(state)
 
 
+def _format_title(message: str, dep_pr: int | None) -> str:
+    return f"[dep #{dep_pr}] {message}" if dep_pr is not None else message
+
+
+def _apply_title_prefix(pr_num: int, dep_pr: int | None) -> bool:
+    cur_title = gh("pr", "view", str(pr_num), "--json", "title", "-q", ".title")
+    stripped = DEP_PREFIX_RE.sub("", cur_title)
+    new_title = _format_title(stripped, dep_pr)
+    if new_title == cur_title:
+        return False
+    gh("pr", "edit", str(pr_num), "--title", new_title)
+    return True
+
+
 def cmd_create(args):
     state = load_state()
     tree = current_tree()
@@ -309,7 +323,7 @@ def cmd_create(args):
             die(f"dep branch {dep!r} has no open PR — create its PR first")
         dep_pr = dep_entry["pr"]
 
-    title = f"[dep #{dep_pr}] {args.message}" if dep_pr is not None else args.message
+    title = _format_title(args.message, dep_pr)
 
     git("push", "-u", "origin", cur, capture=False)
 
@@ -363,12 +377,7 @@ def cmd_target(args):
     new_base = new_dep if new_dep is not None else db
 
     gh("pr", "edit", str(entry["pr"]), "--base", new_base)
-
-    cur_title = gh("pr", "view", str(entry["pr"]), "--json", "title", "-q", ".title")
-    stripped = DEP_PREFIX_RE.sub("", cur_title)
-    new_title = f"[dep #{new_dep_pr}] {stripped}" if new_dep_pr is not None else stripped
-    if new_title != cur_title:
-        gh("pr", "edit", str(entry["pr"]), "--title", new_title)
+    _apply_title_prefix(entry["pr"], new_dep_pr)
 
     entry["depends_on"] = new_dep
     save_state(state)
@@ -390,6 +399,31 @@ def cmd_rebase(args):
     rc = subprocess.run(["git", "rebase", "-i", f"origin/{target}"]).returncode
     if rc != 0:
         sys.exit(rc)
+
+
+def cmd_update(args):
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cur = current_branch()
+    entry = rs["branches"].get(cur)
+    if not entry or entry.get("pr") is None:
+        die(f"no open PR for current branch {cur}")
+    if entry.get("status") != "open":
+        die(f"PR #{entry['pr']} is not open (status={entry['status']})")
+
+    dep = entry["depends_on"]
+    dep_pr = None
+    if dep is not None:
+        dep_entry = rs["branches"].get(dep)
+        if not dep_entry or dep_entry.get("pr") is None or dep_entry.get("status") != "open":
+            die(f"dep branch {dep!r} has no open PR")
+        dep_pr = dep_entry["pr"]
+
+    if _apply_title_prefix(entry["pr"], dep_pr):
+        print(f"updated PR #{entry['pr']} title")
+    else:
+        print(f"PR #{entry['pr']} title already correct")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -416,6 +450,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("rebase", help="rebase current branch onto its dep")
 
+    sub.add_parser("update", help="sync current PR's title prefix with its dep state")
+
     return p
 
 
@@ -431,6 +467,7 @@ def main(argv: list[str] | None = None):
         "fetch": cmd_fetch,
         "target": cmd_target,
         "rebase": cmd_rebase,
+        "update": cmd_update,
     }
     try:
         handlers[args.cmd](args)
