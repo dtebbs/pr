@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+import pytest
+
 import pr
 
 
@@ -37,3 +39,21 @@ def test_pr_rebase_invokes_git_rebase(git_sandbox, fake_gh_on_path, isolated_sta
     pr.main(["rebase"])
 
     assert pr.needs_rebase("feat", "main", "main") == "ok"
+
+
+def test_pr_rebase_exits_cleanly_when_git_rebase_fails(
+    git_sandbox, fake_gh_on_path, isolated_state, monkeypatch
+):
+    pr.main(["branch", "feat"])
+    _commit_on(git_sandbox, "feat", "feat.txt", "feat\n")
+    _commit_on(git_sandbox, "main", "main2.txt", "main2\n")
+
+    subprocess.run(["git", "checkout", "feat"], cwd=git_sandbox, check=True, capture_output=True)
+    (git_sandbox / "feat.txt").write_text("dirty unstaged change\n")
+    monkeypatch.setenv("GIT_SEQUENCE_EDITOR", "true")
+    monkeypatch.setenv("GIT_EDITOR", "true")
+
+    with pytest.raises(SystemExit) as exc:
+        pr.main(["rebase"])
+
+    assert exc.value.code not in (0, None)

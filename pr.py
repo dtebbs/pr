@@ -387,7 +387,9 @@ def cmd_rebase(args):
         die(f"no state entry for {cur} — use `pr branch` or `pr create` first")
     db = default_branch()
     target = entry["depends_on"] if entry["depends_on"] is not None else db
-    subprocess.run(["git", "rebase", "-i", f"origin/{target}"]).check_returncode()
+    rc = subprocess.run(["git", "rebase", "-i", f"origin/{target}"]).returncode
+    if rc != 0:
+        sys.exit(rc)
 
 
 def build_parser() -> argparse.ArgumentParser:
