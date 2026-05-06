@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pr"
+version = "0.1.0"
+description = "Stacked-PR manager for GitHub"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Duncan Tebbs" }]
+dependencies = []
+
+[project.scripts]
+pr = "pr:main"
+
+[tool.setuptools]
+py-modules = ["pr"]

@@ -1,18 +1,22 @@
 # pr
 
-Stacked-PR manager for GitHub. State at `~/.pr.json`, keyed by git toplevel.
-Requires `gh` on `$PATH`.
+(Vibe-coded) Stacked-PR manager for GitHub. State at `~/.pr.json`, keyed by
+git toplevel.  Requires `gh` on `$PATH`.
+
+Install (Python 3.10+):
 
 ```
-pr branch feat/foo       # branch + record dep on current branch
-pr create -m "..."       # push + open draft PR (--ready for non-draft)
-pr fetch                 # refresh state with every open PR in the repo
-pr                       # render the forest (mine + teammates')
-pr target other          # retarget current PR's base
-pr rebase                # rebase current branch onto its dep
+pipx install git+https://github.com/dtebbs/pr.git   # or: uv tool install git+...
+pipx upgrade pr                                     # later, to update
 ```
 
-`pr show` is a pure render of cached state — offline. Run `pr fetch` to refresh.
-Teammates' PRs are flagged `(external)`.
+Type:
+
+```
+pr --help
+```
+
+for options.  `pr show` is a pure render of cached state — offline. Run `pr
+fetch` to refresh.  Teammates' PRs are flagged `(external)`.
 
 Tests: `make test`.
