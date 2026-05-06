@@ -4,8 +4,8 @@ import json
 import pr
 
 
-LIST_FIELDS = "number,headRefName,baseRefName,state,closedAt,author"
-VIEW_FIELDS = "state,baseRefName,closedAt"
+LIST_FIELDS = "number,headRefName,baseRefName,state,closedAt,author,title"
+VIEW_FIELDS = "state,baseRefName,closedAt,title"
 
 
 def _key(*argv):
@@ -38,7 +38,7 @@ def _set_login(fixture_dir, login):
     _write_text_fixture(fixture_dir, _user_argv(), login + "\n")
 
 
-def _pr(*, number, head, base="main", author="someone", state="OPEN", closed_at=None):
+def _pr(*, number, head, base="main", author="someone", state="OPEN", closed_at=None, title="t"):
     return {
         "number": number,
         "headRefName": head,
@@ -46,17 +46,18 @@ def _pr(*, number, head, base="main", author="someone", state="OPEN", closed_at=
         "state": state,
         "closedAt": closed_at,
         "author": {"login": author},
+        "title": title,
     }
 
 
-def _view_payload(*, base="main", state="OPEN", closed_at=None):
-    return {"state": state, "baseRefName": base, "closedAt": closed_at}
+def _view_payload(*, base="main", state="OPEN", closed_at=None, title="t"):
+    return {"state": state, "baseRefName": base, "closedAt": closed_at, "title": title}
 
 
 def _wire_views(fixture_dir, prs):
     for p in prs:
         _write_json_fixture(fixture_dir, _view_argv(p["number"]),
-                            _view_payload(base=p["baseRefName"]))
+                            _view_payload(base=p["baseRefName"], title=p["title"]))
 
 
 def test_fetch_discovers_all_open_prs(git_sandbox, fake_gh_on_path, isolated_state):

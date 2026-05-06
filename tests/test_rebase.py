@@ -24,7 +24,7 @@ def test_needs_rebase_detects_advanced_dep(git_sandbox, fake_gh_on_path, isolate
 
     _commit_on(git_sandbox, "main", "main2.txt", "main2\n")
 
-    assert pr.needs_rebase("feat", "main", "main") == "needs-rebase"
+    assert pr.needs_rebase("feat", "main", "main") == "rebase"
 
 
 def test_pr_rebase_invokes_git_rebase(git_sandbox, fake_gh_on_path, isolated_state, monkeypatch):

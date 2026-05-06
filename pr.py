@@ -127,15 +127,31 @@ def needs_rebase(branch: str, dep: str | None, db: str) -> str:
         mb = git("merge-base", dep_tip, branch_tip)
     except CmdError:
         return "?"
-    return "ok" if mb == dep_tip else "needs-rebase"
-
-
-def fmt_status(entry: dict) -> str:
-    return entry["status"].upper()
+    return "ok" if mb == dep_tip else "rebase"
 
 
 def fmt_pr(entry: dict) -> str:
     return f"#{entry['pr']}" if entry["pr"] is not None else "-"
+
+
+_ANSI_RED = "31"
+_ANSI_YELLOW = "33"
+_ANSI_GREEN = "32"
+_ANSI_ORANGE = "38;5;208"
+
+
+def _ansi(text: str, code: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _color_rebase(rebase: str) -> str:
+    if rebase == "ok":
+        return _ansi(rebase, _ANSI_GREEN)
+    if rebase == "rebase":
+        return _ansi(rebase, _ANSI_ORANGE)
+    return rebase
 
 
 def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
@@ -147,35 +163,63 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
         children.setdefault(parent, []).append(name)
     for v in children.values():
         v.sort()
-    lines = [db]
-    for i, name in enumerate(children.get(db, [])):
-        _render_lines(lines, name, children, visible, prefix="",
-                      is_last=(i == len(children[db]) - 1),
-                      rebase_fn=rebase_fn)
+
+    def _walk(rows_out: list, name: str, prefix: str, is_last: bool):
+        entry = visible[name]
+        rebase = rebase_fn(name, entry["depends_on"])
+        rows_out.append({
+            "lead": prefix + ("└─ " if is_last else "├─ "),
+            "name": f"[{name}]",
+            "pr": fmt_pr(entry),
+            "ext": "(ext)" if entry.get("external") else "",
+            "rebase": rebase,
+            "title": DEP_PREFIX_RE.sub("", entry.get("title") or ""),
+        })
+        kids = children.get(name, [])
+        new_prefix = prefix + ("   " if is_last else "│  ")
+        for i, child in enumerate(kids):
+            _walk(rows_out, child, new_prefix, i == len(kids) - 1)
+
+    groups: list[tuple[str, list[dict]]] = []
+
+    db_rows: list[dict] = []
+    db_kids = children.get(db, [])
+    for i, name in enumerate(db_kids):
+        _walk(db_rows, name, "", i == len(db_kids) - 1)
+    groups.append((_ansi(f"[{db}]", _ANSI_RED), db_rows))
+
     externals = sorted(set(children) - {db} - set(visible))
-    for ext in externals:
-        lines.append(f"<external: {ext}>")
-        kids = children[ext]
+    for ext_name in externals:
+        ext_rows: list[dict] = []
+        kids = children[ext_name]
         for i, name in enumerate(kids):
-            _render_lines(lines, name, children, visible, prefix="",
-                          is_last=(i == len(kids) - 1),
-                          rebase_fn=rebase_fn)
+            _walk(ext_rows, name, "", i == len(kids) - 1)
+        groups.append((f"<external: {ext_name}>", ext_rows))
+
+    all_rows = [r for _, rs in groups for r in rs]
+    max_lead_name = max((len(r["lead"]) + len(r["name"]) for r in all_rows), default=0)
+    widths = {c: max((len(r[c]) for r in all_rows), default=0) for c in ("pr", "ext", "rebase")}
+
+    def _format(r: dict) -> str:
+        parts = [
+            r["lead"],
+            _ansi(r["name"], _ANSI_RED),
+            " " * (max_lead_name - len(r["lead"]) - len(r["name"])),
+        ]
+        parts.append("  " + _ansi(r["pr"], _ANSI_YELLOW) + " " * (widths["pr"] - len(r["pr"])))
+        if widths["ext"] > 0:
+            parts.append("  " + r["ext"] + " " * (widths["ext"] - len(r["ext"])))
+        parts.append("  " + _color_rebase(r["rebase"]) + " " * (widths["rebase"] - len(r["rebase"])))
+        if r["title"]:
+            parts.append("  " + r["title"])
+        return "".join(parts).rstrip()
+
+    lines: list[str] = []
+    for header, rs in groups:
+        lines.append(header)
+        for r in rs:
+            lines.append(_format(r))
     return lines
-
-
-def _render_lines(lines, name, children, visible, *, prefix, is_last, rebase_fn):
-    glyph = "└── " if is_last else "├── "
-    entry = visible[name]
-    rebase = rebase_fn(name, entry["depends_on"])
-    row = f"{name}  {fmt_pr(entry)}  {fmt_status(entry)}  {rebase}"
-    if entry.get("external"):
-        row += "  (external)"
-    lines.append(f"{prefix}{glyph}{row}")
-    kids = children.get(name, [])
-    new_prefix = prefix + ("    " if is_last else "│   ")
-    for i, child in enumerate(kids):
-        _render_lines(lines, child, children, visible, prefix=new_prefix,
-                      is_last=(i == len(kids) - 1), rebase_fn=rebase_fn)
 
 
 def cmd_show(args):
@@ -218,7 +262,7 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
     git("fetch", "--all", "--prune", capture=False)
     db = default_branch()
 
-    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author"]
+    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author", "title"]
     discovered = gh_json(
         ["pr", "list", "--state", "open", "--limit", "1000"],
         list_fields,
@@ -239,9 +283,10 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
                 "status": pr["state"].lower(),
                 "closed_at": pr["closedAt"],
                 "external": login != me,
+                "title": pr["title"],
             }
 
-    view_fields = ["state", "baseRefName", "closedAt"]
+    view_fields = ["state", "baseRefName", "closedAt", "title"]
     for name, entry in list(rs["branches"].items()):
         if entry["pr"] is None:
             continue
@@ -257,6 +302,7 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
         entry["status"] = st
         base = data["baseRefName"]
         entry["depends_on"] = None if base == db else base
+        entry["title"] = data["title"]
         if st in ("merged", "closed"):
             entry["closed_at"] = data["closedAt"]
         else:
@@ -382,7 +428,7 @@ def cmd_target(args):
     entry["depends_on"] = new_dep
     save_state(state)
 
-    if needs_rebase(cur, new_dep, db) == "needs-rebase":
+    if needs_rebase(cur, new_dep, db) == "rebase":
         print("note: branch needs rebase onto new dep — run `pr rebase`")
 
 

@@ -29,6 +29,3 @@ def test_fmt_pr():
     assert pr.fmt_pr({"pr": None}) == "-"
 
 
-def test_fmt_status():
-    assert pr.fmt_status({"status": "open"}) == "OPEN"
-    assert pr.fmt_status({"status": "no-pr"}) == "NO-PR"
