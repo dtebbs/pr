@@ -406,9 +406,8 @@ def cmd_target(args):
     rs = tree_state(state, tree)
     cur = current_branch()
     entry = rs["branches"].get(cur)
-    if not entry or entry.get("pr") is None:
-        die(f"no open PR for current branch {cur} — use `pr create`")
-    if entry.get("status") != "open":
+
+    if entry and entry.get("pr") is not None and entry.get("status") != "open":
         die(f"PR #{entry['pr']} is not open (status={entry['status']})")
 
     new_dep = None if args.main else args.branch
@@ -420,12 +419,21 @@ def cmd_target(args):
         new_dep_pr = dep_entry["pr"]
 
     db = default_branch()
-    new_base = new_dep if new_dep is not None else db
 
-    gh("pr", "edit", str(entry["pr"]), "--base", new_base)
-    _apply_title_prefix(entry["pr"], new_dep_pr)
+    if entry and entry.get("pr") is not None:
+        new_base = new_dep if new_dep is not None else db
+        gh("pr", "edit", str(entry["pr"]), "--base", new_base)
+        _apply_title_prefix(entry["pr"], new_dep_pr)
 
-    entry["depends_on"] = new_dep
+    if entry is None:
+        rs["branches"][cur] = {
+            "pr": None,
+            "depends_on": new_dep,
+            "status": "no-pr",
+            "closed_at": None,
+        }
+    else:
+        entry["depends_on"] = new_dep
     save_state(state)
 
     if needs_rebase(cur, new_dep, db) == "rebase":
