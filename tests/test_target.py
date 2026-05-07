@@ -73,3 +73,13 @@ def test_target_dies_if_current_pr_is_closed(git_sandbox, fake_gh_on_path, isola
 
     with pytest.raises(SystemExit):
         pr.main(["target", "b"])
+
+
+def test_target_default_branch_by_name_clears_dep(git_sandbox, fake_gh_on_path, isolated_state):
+    pr.main(["branch", "wip"])  # currently checked out on `wip`
+    _seed(isolated_state, {"wip": _entry(None, dep="a"), "a": _entry(5)})
+
+    pr.main(["target", "main"])  # `main` is the default branch — should clear dep
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert branches["wip"]["depends_on"] is None

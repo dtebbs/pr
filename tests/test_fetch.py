@@ -166,6 +166,20 @@ def test_fetch_keeps_entry_with_local_ref_only(git_sandbox, fake_gh_on_path, iso
     assert "local-only" in branches
 
 
+def test_fetch_normalizes_stale_default_branch_dep(git_sandbox, fake_gh_on_path, isolated_state):
+    _set_login(fake_gh_on_path, "alice")
+    _write_json_fixture(fake_gh_on_path, _list_argv(), [])
+    # Pre-existing poisoned state: depends_on points at the default branch.
+    _seed(isolated_state, {
+        "a": {"pr": None, "depends_on": "main", "status": "no-pr", "closed_at": None},
+    })
+
+    pr.main(["fetch"])
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert branches["a"]["depends_on"] is None
+
+
 def test_fetch_keeps_entry_with_remote_ref_only(git_sandbox, fake_gh_on_path, isolated_state):
     _set_login(fake_gh_on_path, "alice")
     _write_json_fixture(fake_gh_on_path, _list_argv(), [])

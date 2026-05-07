@@ -288,7 +288,8 @@ def cmd_branch(args):
     if args.name in rs["branches"]:
         die(f"branch {args.name} already tracked in state")
     cur = current_branch()
-    dep = None if args.main else cur
+    db = default_branch()
+    dep = None if args.main or cur == db else cur
     git("checkout", "-b", args.name, capture=False)
     rs["branches"][args.name] = {
         "pr": None,
@@ -351,6 +352,10 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
             entry["closed_at"] = data["closedAt"]
         else:
             entry["closed_at"] = None
+
+    for entry in rs["branches"].values():
+        if entry.get("depends_on") == db:
+            entry["depends_on"] = None
 
     refs_out = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin")
     known_refs = set(refs_out.splitlines()) if refs_out else set()
@@ -463,15 +468,14 @@ def cmd_target(args):
     if entry and entry.get("pr") is not None and entry.get("status") != "open":
         die(f"PR #{entry['pr']} is not open (status={entry['status']})")
 
-    new_dep = None if args.main else args.branch
+    db = default_branch()
+    new_dep = None if args.main or args.branch == db else args.branch
     new_dep_pr = None
     if new_dep is not None:
         dep_entry = rs["branches"].get(new_dep)
         if not dep_entry or dep_entry.get("pr") is None or dep_entry.get("status") != "open":
             die(f"target branch {new_dep!r} has no open PR")
         new_dep_pr = dep_entry["pr"]
-
-    db = default_branch()
 
     if entry and entry.get("pr") is not None:
         new_base = new_dep if new_dep is not None else db
