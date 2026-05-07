@@ -1,7 +1,18 @@
 import hashlib
 import json
+import os
+import subprocess
 
 import pr
+
+
+def _ensure_origin_refs(cwd, names):
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for name in names:
+        subprocess.run(["git", "branch", name, "main"], cwd=cwd, capture_output=True, env=env)
+        subprocess.run(["git", "push", "origin", name], cwd=cwd, capture_output=True, env=env)
+        subprocess.run(["git", "branch", "-D", name], cwd=cwd, capture_output=True, env=env)
 
 
 LIST_FIELDS = "number,headRefName,baseRefName,state,closedAt,author,title,statusCheckRollup"
@@ -76,6 +87,7 @@ def test_fetch_discovers_all_open_prs(git_sandbox, fake_gh_on_path, isolated_sta
         _pr(number=2, head="bob/bar", author="bob"),
         _pr(number=3, head="carol/baz", author="carol", base="bob/bar"),
     ]
+    _ensure_origin_refs(git_sandbox, [p["headRefName"] for p in prs])
     _write_json_fixture(fake_gh_on_path, _list_argv(), prs)
     _wire_views(fake_gh_on_path, prs)
 
@@ -95,6 +107,7 @@ def test_fetch_marks_external_correctly(git_sandbox, fake_gh_on_path, isolated_s
         _pr(number=10, head="mine", author="alice"),
         _pr(number=11, head="theirs", author="bob"),
     ]
+    _ensure_origin_refs(git_sandbox, [p["headRefName"] for p in prs])
     _write_json_fixture(fake_gh_on_path, _list_argv(), prs)
     _wire_views(fake_gh_on_path, prs)
 
@@ -118,6 +131,54 @@ def test_fetch_preserves_local_no_pr_entries(git_sandbox, fake_gh_on_path, isola
     assert branches["wip"]["status"] == "no-pr"
 
 
+def _seed(state_path, branches):
+    state_path.write_text(json.dumps({
+        "version": pr.STATE_VERSION,
+        "trees": {pr.current_tree(): {"branches": branches}},
+    }))
+
+
+def _no_pr_entry():
+    return {"pr": None, "depends_on": None, "status": "no-pr", "closed_at": None}
+
+
+def test_fetch_drops_entry_with_no_local_or_remote_ref(git_sandbox, fake_gh_on_path, isolated_state):
+    _set_login(fake_gh_on_path, "alice")
+    _write_json_fixture(fake_gh_on_path, _list_argv(), [])
+    _seed(isolated_state, {"ghost": _no_pr_entry()})
+
+    pr.main(["fetch"])
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert "ghost" not in branches
+
+
+def test_fetch_keeps_entry_with_local_ref_only(git_sandbox, fake_gh_on_path, isolated_state):
+    _set_login(fake_gh_on_path, "alice")
+    _write_json_fixture(fake_gh_on_path, _list_argv(), [])
+    subprocess.run(["git", "checkout", "-b", "local-only", "main"],
+                   cwd=git_sandbox, check=True, capture_output=True)
+    _seed(isolated_state, {"local-only": _no_pr_entry()})
+
+    pr.main(["fetch"])
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert "local-only" in branches
+
+
+def test_fetch_keeps_entry_with_remote_ref_only(git_sandbox, fake_gh_on_path, isolated_state):
+    _set_login(fake_gh_on_path, "alice")
+    _write_json_fixture(fake_gh_on_path, _list_argv(), [])
+    subprocess.run(["git", "checkout", "main"], cwd=git_sandbox, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-D", "a"], cwd=git_sandbox, check=True, capture_output=True)
+    _seed(isolated_state, {"a": _no_pr_entry()})
+
+    pr.main(["fetch"])
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert "a" in branches
+
+
 def test_fetch_persists_ci_status(git_sandbox, fake_gh_on_path, isolated_state):
     _set_login(fake_gh_on_path, "alice")
     prs = [
@@ -129,6 +190,7 @@ def test_fetch_persists_ci_status(git_sandbox, fake_gh_on_path, isolated_state):
             checks=[{"status": "IN_PROGRESS", "conclusion": None}]),
         _pr(number=23, head="empty", author="alice", checks=[]),
     ]
+    _ensure_origin_refs(git_sandbox, [p["headRefName"] for p in prs])
     _write_json_fixture(fake_gh_on_path, _list_argv(), prs)
     _wire_views(fake_gh_on_path, prs)
 

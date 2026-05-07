@@ -272,6 +272,10 @@ def cmd_show(args):
         n: e for n, e in rs["branches"].items()
         if args.all or e.get("status") not in ("merged", "closed")
     }
+    if args.org:
+        for name in visible:
+            print(f"** TODO [{name}]")
+        return
     rb = lambda name, dep: needs_rebase(name, dep, db)
     for line in render_tree(visible, db, rb):
         print(line)
@@ -347,6 +351,15 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
             entry["closed_at"] = data["closedAt"]
         else:
             entry["closed_at"] = None
+
+    refs_out = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin")
+    known_refs = set(refs_out.splitlines()) if refs_out else set()
+    for name in list(rs["branches"]):
+        if f"refs/heads/{name}" in known_refs:
+            continue
+        if f"refs/remotes/origin/{name}" in known_refs:
+            continue
+        del rs["branches"][name]
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg["closed_retention_hours"])
     to_drop: list[str] = []
@@ -526,6 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("show", help="display the PR tree (default)")
     s.add_argument("--all", action="store_true", help="include merged/closed PRs")
+    s.add_argument("--org", action="store_true", help="Print the list of PRs as org-mode titles")
 
     b = sub.add_parser("branch", help="create a tracked branch with a dep")
     b.add_argument("name")
