@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -182,7 +183,7 @@ def _color_rebase(rebase: str) -> str:
     return rebase
 
 
-def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
+def render_tree(visible: dict, db: str, rebase_fn, current: str | None = None) -> list[str]:
     if not visible:
         return ["no open tracked branches"]
     children: dict[str, list[str]] = {}
@@ -199,6 +200,7 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
             "lead": prefix + ("└─ " if is_last else "├─ "),
             "name": f"[{name}]",
             "external": bool(entry.get("external")),
+            "current": name == current,
             "pr": fmt_pr(entry),
             "ci": entry.get("ci") or "none",
             "rebase": rebase,
@@ -215,7 +217,8 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
     db_kids = children.get(db, [])
     for i, name in enumerate(db_kids):
         _walk(db_rows, name, "", i == len(db_kids) - 1)
-    groups.append((_ansi(f"[{db}]", _ANSI_RED), db_rows))
+    db_color = f"1;{_ANSI_RED}" if db == current else _ANSI_RED
+    groups.append((_ansi(f"[{db}]", db_color), db_rows))
 
     externals = sorted(set(children) - {db} - set(visible))
     for ext_name in externals:
@@ -240,6 +243,8 @@ def render_tree(visible: dict, db: str, rebase_fn) -> list[str]:
 
     def _format(r: dict) -> str:
         name_color = _ANSI_WHITE if r["external"] else _ANSI_RED
+        if r["current"]:
+            name_color = f"1;{name_color}"
         parts = [
             r["lead"],
             _ansi(r["name"], name_color),
@@ -276,8 +281,12 @@ def cmd_show(args):
         for name in visible:
             print(f"** TODO [{name}]")
         return
+    try:
+        cur = current_branch()
+    except CmdError:
+        cur = None
     rb = lambda name, dep: needs_rebase(name, dep, db)
-    for line in render_tree(visible, db, rb):
+    for line in render_tree(visible, db, rb, current=cur):
         print(line)
 
 
@@ -537,6 +546,88 @@ def cmd_update(args):
         print(f"PR #{entry['pr']} title already correct")
 
 
+def cmd_review(args):
+    cur = current_branch()
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    entry = rs["branches"].get(cur)
+    parent = (entry or {}).get("depends_on") or default_branch()
+
+    diff = git("diff", "--no-ext-diff", f"origin/{parent}..HEAD")
+    if not diff.strip():
+        print(f"no diff between {cur} and origin/{parent}")
+        return
+
+    prompt = (
+        f"Review this git diff (branch `{cur}` vs parent `origin/{parent}`). "
+        "If there are no real issues, respond with exactly: No issues.\n"
+        "Only flag actual bugs, correctness problems, or security issues. "
+        "Do not suggest stylistic improvements or speculative concerns. "
+        "You may read files in this repository for context.\n\n"
+        f"Diff:\n{diff}\n"
+    )
+
+    proc = subprocess.run(
+        ["claude", "-p", "--tools", "Read,Glob,Grep"],
+        input=prompt,
+        text=True,
+    )
+    if proc.returncode != 0:
+        die(f"claude exited with code {proc.returncode}", code=proc.returncode)
+
+
+_AUTOMERGE_POLL_SECONDS = 20
+
+
+def cmd_automerge(args):
+    branch = args.branch or current_branch()
+
+    listed = gh_json(
+        ["pr", "list", "--head", branch, "--state", "open"],
+        ["number"],
+    )
+    if not isinstance(listed, list):
+        raise CmdError(f"gh pr list returned non-list: {listed!r}")
+    if not listed:
+        die(f"no open PR for branch {branch!r}")
+    if len(listed) > 1:
+        nums = ", ".join(f"#{p['number']}" for p in listed)
+        die(f"multiple open PRs for branch {branch!r}: {nums}")
+    pr_num = listed[0]["number"]
+
+    view_fields = ["state", "statusCheckRollup", "mergeStateStatus"]
+    while True:
+        data = gh_json(["pr", "view", str(pr_num)], view_fields)
+        if not isinstance(data, dict):
+            raise CmdError(f"gh pr view returned non-dict: {data!r}")
+        require_keys(data, view_fields, "gh pr view")
+
+        state = (data["state"] or "").upper()
+        merge_state = (data["mergeStateStatus"] or "").upper()
+        ci = _summarize_checks(data["statusCheckRollup"])
+
+        if state != "OPEN":
+            die(f"PR #{pr_num} is no longer open (state={state})")
+        if ci == "fail":
+            die(f"PR #{pr_num} has failing CI")
+        if merge_state == "BEHIND":
+            die(f"PR #{pr_num} is behind its base — needs rebase")
+        if merge_state == "DIRTY":
+            die(f"PR #{pr_num} has merge conflicts")
+        if merge_state == "BLOCKED":
+            die(f"PR #{pr_num} is blocked (required reviews or branch protection)")
+
+        if ci in ("pass", "none"):
+            print(f"merging PR #{pr_num}…")
+            gh("pr", "merge", str(pr_num), "--merge", capture=False)
+            print(f"merged PR #{pr_num}")
+            return
+
+        print(f"PR #{pr_num} CI: {ci}; sleeping {_AUTOMERGE_POLL_SECONDS}s…")
+        time.sleep(_AUTOMERGE_POLL_SECONDS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pr", description="stacked-PR manager")
     sub = p.add_subparsers(dest="cmd")
@@ -564,6 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("update", help="sync current PR's title prefix with its dep state")
 
+    sub.add_parser("review", help="run claude (read-only) over the diff vs the branch's parent")
+
+    am = sub.add_parser("automerge", help="poll a branch's PR and merge when CI passes")
+    am.add_argument("branch", nargs="?", help="branch to merge (defaults to current branch)")
+
     return p
 
 
@@ -580,6 +676,8 @@ def main(argv: list[str] | None = None):
         "target": cmd_target,
         "rebase": cmd_rebase,
         "update": cmd_update,
+        "review": cmd_review,
+        "automerge": cmd_automerge,
     }
     try:
         handlers[args.cmd](args)
