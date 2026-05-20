@@ -580,23 +580,68 @@ def cmd_review(args):
 _AUTOMERGE_POLL_SECONDS = 20
 
 
-def cmd_automerge(args):
-    branch = args.branch or current_branch()
+def _resolve_merge_chain(branch: str, db: str) -> list[int]:
+    """Walk PRs upstream from `branch` until reaching the default branch.
+    Returns PR numbers in merge order (ancestor-adjacent-to-db first)."""
+    chain: list[int] = []
+    cur_head = branch
+    seen: set[str] = set()
+    while True:
+        if cur_head in seen:
+            die(f"cycle detected at branch {cur_head!r}")
+        seen.add(cur_head)
+        listed = gh_json(
+            ["pr", "list", "--head", cur_head, "--state", "open"],
+            ["number", "baseRefName"],
+        )
+        if not isinstance(listed, list):
+            raise CmdError(f"gh pr list returned non-list: {listed!r}")
+        if not listed:
+            if not chain:
+                die(f"no open PR for branch {cur_head!r}")
+            die(f"ancestor branch {cur_head!r} has no open PR — chain broken")
+        if len(listed) > 1:
+            nums = ", ".join(f"#{p['number']}" for p in listed)
+            die(f"multiple open PRs for branch {cur_head!r}: {nums}")
+        pr_data = listed[0]
+        chain.append(pr_data["number"])
+        base = pr_data["baseRefName"]
+        if base == db:
+            break
+        cur_head = base
+    return list(reversed(chain))
 
+
+def _strip_dep_prefix_on_dependents(merged_head: str):
     listed = gh_json(
-        ["pr", "list", "--head", branch, "--state", "open"],
-        ["number"],
+        ["pr", "list", "--base", merged_head, "--state", "open"],
+        ["number", "title"],
     )
     if not isinstance(listed, list):
         raise CmdError(f"gh pr list returned non-list: {listed!r}")
-    if not listed:
-        die(f"no open PR for branch {branch!r}")
-    if len(listed) > 1:
-        nums = ", ".join(f"#{p['number']}" for p in listed)
-        die(f"multiple open PRs for branch {branch!r}: {nums}")
-    pr_num = listed[0]["number"]
+    for item in listed:
+        require_keys(item, ["number", "title"], "gh pr list")
+        new_title = DEP_PREFIX_RE.sub("", item["title"])
+        if new_title != item["title"]:
+            print(f"updating dependent PR #{item['number']} title")
+            gh("pr", "edit", str(item["number"]), "--title", new_title)
 
-    view_fields = ["state", "statusCheckRollup", "mergeStateStatus"]
+
+def _automerge_one(pr_num: int, db: str):
+    view_fields = ["state", "statusCheckRollup", "mergeStateStatus", "baseRefName", "title", "headRefName"]
+
+    snapshot = gh_json(["pr", "view", str(pr_num)], view_fields)
+    if not isinstance(snapshot, dict):
+        raise CmdError(f"gh pr view returned non-dict: {snapshot!r}")
+    require_keys(snapshot, view_fields, "gh pr view")
+    if (snapshot["state"] or "").upper() != "OPEN":
+        die(f"PR #{pr_num} is not open (state={snapshot['state']})")
+
+    if snapshot["baseRefName"] != db:
+        print(f"retargeting PR #{pr_num} base to {db}")
+        gh("pr", "edit", str(pr_num), "--base", db)
+
+    rebased = False
     while True:
         data = gh_json(["pr", "view", str(pr_num)], view_fields)
         if not isinstance(data, dict):
@@ -609,23 +654,51 @@ def cmd_automerge(args):
 
         if state != "OPEN":
             die(f"PR #{pr_num} is no longer open (state={state})")
-        if ci == "fail":
-            die(f"PR #{pr_num} has failing CI")
-        if merge_state == "BEHIND":
-            die(f"PR #{pr_num} is behind its base — needs rebase")
         if merge_state == "DIRTY":
-            die(f"PR #{pr_num} has merge conflicts")
+            die(f"PR #{pr_num} has merge conflicts — can't rebase")
         if merge_state == "BLOCKED":
             die(f"PR #{pr_num} is blocked (required reviews or branch protection)")
+        if ci == "fail":
+            die(f"PR #{pr_num} has failing CI")
 
-        if ci in ("pass", "none"):
+        if merge_state == "BEHIND":
+            if rebased:
+                die(f"PR #{pr_num} still behind after rebase attempt")
+            print(f"rebasing PR #{pr_num} onto {db} on server…")
+            try:
+                gh("pr", "update-branch", str(pr_num), "--rebase", capture=False)
+            except CmdError as e:
+                die(f"failed to rebase PR #{pr_num}: {e}")
+            rebased = True
+            time.sleep(_AUTOMERGE_POLL_SECONDS)
+            continue
+
+        if ci in ("pass", "none") and merge_state in ("CLEAN", "UNSTABLE", "HAS_HOOKS"):
+            cur_title = data["title"]
+            stripped = DEP_PREFIX_RE.sub("", cur_title)
+            if stripped != cur_title:
+                print(f"stripping dep prefix from PR #{pr_num}")
+                gh("pr", "edit", str(pr_num), "--title", stripped)
             print(f"merging PR #{pr_num}…")
             gh("pr", "merge", str(pr_num), "--merge", capture=False)
             print(f"merged PR #{pr_num}")
+            _strip_dep_prefix_on_dependents(data["headRefName"])
             return
 
-        print(f"PR #{pr_num} CI: {ci}; sleeping {_AUTOMERGE_POLL_SECONDS}s…")
+        print(f"PR #{pr_num} CI: {ci}, merge: {merge_state}; sleeping {_AUTOMERGE_POLL_SECONDS}s…")
         time.sleep(_AUTOMERGE_POLL_SECONDS)
+
+
+def cmd_automerge(args):
+    branch = args.branch or current_branch()
+    db = default_branch()
+
+    print(f"resolving merge chain for {branch}…")
+    chain = _resolve_merge_chain(branch, db)
+    print("chain (ancestor-first): " + ", ".join(f"#{n}" for n in chain))
+
+    for pr_num in chain:
+        _automerge_one(pr_num, db)
 
 
 def build_parser() -> argparse.ArgumentParser:
