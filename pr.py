@@ -612,6 +612,27 @@ def _resolve_merge_chain(branch: str, db: str) -> list[int]:
     return list(reversed(chain))
 
 
+def _is_behind(base: str, head: str) -> bool:
+    """True iff `origin/base` has commits not in `origin/head` — i.e., the
+    branch is missing recent base commits and needs a rebase.
+
+    Independent of branch protection (mergeStateStatus only reports BEHIND
+    when 'Require branches to be up to date' is enabled)."""
+    git("fetch", "--quiet", "origin", base, head, capture=False)
+    proc = run(
+        ["git", "merge-base", "--is-ancestor", f"origin/{base}", f"origin/{head}"],
+        check=False,
+    )
+    if proc.returncode == 0:
+        return False
+    if proc.returncode == 1:
+        return True
+    raise CmdError(
+        f"git merge-base --is-ancestor origin/{base} origin/{head} exited "
+        f"{proc.returncode}: {(proc.stderr or '').strip()}"
+    )
+
+
 def _strip_dep_prefix_on_dependents(merged_head: str):
     listed = gh_json(
         ["pr", "list", "--base", merged_head, "--state", "open"],
@@ -661,10 +682,13 @@ def _automerge_one(pr_num: int, db: str):
         if ci == "fail":
             die(f"PR #{pr_num} has failing CI")
 
-        if merge_state == "BEHIND":
+        behind = merge_state == "BEHIND"
+        if not behind:
+            behind = _is_behind(data["baseRefName"], data["headRefName"])
+        if behind:
             if rebased:
                 die(f"PR #{pr_num} still behind after rebase attempt")
-            print(f"rebasing PR #{pr_num} onto {db} on server…")
+            print(f"pr: warning: PR #{pr_num} is behind {db} — rebasing on server", file=sys.stderr)
             try:
                 gh("pr", "update-branch", str(pr_num), "--rebase", capture=False)
             except CmdError as e:

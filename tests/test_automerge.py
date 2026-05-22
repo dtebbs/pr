@@ -5,7 +5,7 @@ import pr
 
 class FakePR:
     def __init__(self, *, number, head, base="main", title="t",
-                 state="OPEN", merge_state="CLEAN", ci="pass"):
+                 state="OPEN", merge_state="CLEAN", ci="pass", behind_by=0):
         self.number = number
         self.head = head
         self.base = base
@@ -13,6 +13,7 @@ class FakePR:
         self.state = state
         self.merge_state = merge_state
         self.ci = ci  # "pass" | "fail" | "pending" | "none"
+        self.behind_by = behind_by
 
     def rollup(self):
         if self.ci == "pass":
@@ -72,6 +73,12 @@ class FakeServer:
             return {k: full[k] for k in fields}
         raise AssertionError(f"unexpected gh_json: {argv!r}")
 
+    def is_behind(self, base, head):
+        for p in self.prs.values():
+            if p.head == head:
+                return p.behind_by > 0
+        return False
+
     def gh(self, *argv, **kwargs):
         self.gh_calls.append(argv)
         if argv[:2] == ("pr", "edit"):
@@ -86,6 +93,7 @@ class FakeServer:
                 raise self.update_branch_raises
             pr_num = int(argv[2])
             self.prs[pr_num].merge_state = "CLEAN"
+            self.prs[pr_num].behind_by = 0
         elif argv[:2] == ("pr", "merge"):
             pr_num = int(argv[2])
             self.prs[pr_num].state = "MERGED"
@@ -97,6 +105,7 @@ def install_server(monkeypatch, server, current_branch_name="my-branch"):
     monkeypatch.setattr(pr, "gh", server.gh)
     monkeypatch.setattr(pr, "current_branch", lambda: current_branch_name)
     monkeypatch.setattr(pr, "default_branch", lambda: server.default_branch)
+    monkeypatch.setattr(pr, "_is_behind", server.is_behind)
     monkeypatch.setattr(pr.time, "sleep", lambda s: None)
 
 
@@ -159,7 +168,7 @@ def test_automerge_dies_on_blocked(monkeypatch):
         pr.main(["automerge", "feat"])
 
 
-def test_automerge_rebases_when_behind(monkeypatch):
+def test_automerge_rebases_when_behind(monkeypatch, capsys):
     # BEHIND on first view; FakeServer.gh on update-branch flips it to CLEAN.
     s = FakeServer([FakePR(number=42, head="feat", merge_state="BEHIND")])
     install_server(monkeypatch, s)
@@ -168,6 +177,36 @@ def test_automerge_rebases_when_behind(monkeypatch):
 
     update_calls = [c for c in s.gh_calls if c[:2] == ("pr", "update-branch")]
     assert update_calls == [("pr", "update-branch", "42", "--rebase")]
+    assert _merge_calls(s) == [("pr", "merge", "42", "--merge")]
+    err = capsys.readouterr().err
+    assert "warning" in err and "behind" in err and "PR #42" in err
+
+
+def test_automerge_rebases_when_local_check_says_behind(monkeypatch, capsys):
+    # Regression: GitHub reports mergeStateStatus=CLEAN when branch protection
+    # doesn't require up-to-date branches, even though origin/base has commits
+    # not in origin/head. We must still detect via merge-base and rebase.
+    s = FakeServer([FakePR(number=42, head="feat", merge_state="CLEAN", behind_by=5)])
+    install_server(monkeypatch, s)
+
+    pr.main(["automerge", "feat"])
+
+    update_calls = [c for c in s.gh_calls if c[:2] == ("pr", "update-branch")]
+    assert update_calls == [("pr", "update-branch", "42", "--rebase")]
+    err = capsys.readouterr().err
+    assert "warning" in err and "behind" in err and "PR #42" in err
+    assert _merge_calls(s) == [("pr", "merge", "42", "--merge")]
+
+
+def test_automerge_does_not_rebase_when_up_to_date(monkeypatch):
+    # behind_by=0 and merge_state=CLEAN — no rebase, just merge.
+    s = FakeServer([FakePR(number=42, head="feat", merge_state="CLEAN", behind_by=0)])
+    install_server(monkeypatch, s)
+
+    pr.main(["automerge", "feat"])
+
+    update_calls = [c for c in s.gh_calls if c[:2] == ("pr", "update-branch")]
+    assert update_calls == []
     assert _merge_calls(s) == [("pr", "merge", "42", "--merge")]
 
 
@@ -298,6 +337,7 @@ def test_automerge_polls_until_ci_passes(monkeypatch):
     monkeypatch.setattr(pr, "gh", s.gh)
     monkeypatch.setattr(pr, "current_branch", lambda: "feat")
     monkeypatch.setattr(pr, "default_branch", lambda: "main")
+    monkeypatch.setattr(pr, "_is_behind", s.is_behind)
     monkeypatch.setattr(pr.time, "sleep", sleep_then_flip)
 
     pr.main(["automerge", "feat"])
