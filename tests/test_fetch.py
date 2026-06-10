@@ -193,6 +193,27 @@ def test_fetch_keeps_entry_with_remote_ref_only(git_sandbox, fake_gh_on_path, is
     assert "a" in branches
 
 
+def test_fetch_replaces_stale_merged_entry_with_new_open_pr(git_sandbox, fake_gh_on_path, isolated_state):
+    """Branch name reused after merge: stale merged entry must be replaced by the live open PR."""
+    _set_login(fake_gh_on_path, "alice")
+    new_pr = _pr(number=226, head="t/move", author="alice", title="new run")
+    _ensure_origin_refs(git_sandbox, ["t/move"])
+    _write_json_fixture(fake_gh_on_path, _list_argv(), [new_pr])
+    _wire_views(fake_gh_on_path, [new_pr])
+    _seed(isolated_state, {
+        "t/move": {"pr": 217, "depends_on": None, "status": "merged",
+                   "closed_at": "2026-05-21T00:00:00Z", "external": False,
+                   "title": "old run", "ci": "pass"},
+    })
+
+    pr.main(["fetch"])
+
+    branches = json.loads(isolated_state.read_text())["trees"][pr.current_tree()]["branches"]
+    assert branches["t/move"]["pr"] == 226
+    assert branches["t/move"]["status"] == "open"
+    assert branches["t/move"]["title"] == "new run"
+
+
 def test_fetch_persists_ci_status(git_sandbox, fake_gh_on_path, isolated_state):
     _set_login(fake_gh_on_path, "alice")
     prs = [

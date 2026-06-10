@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -108,7 +109,11 @@ def current_user_login() -> str:
 
 
 def default_branch() -> str:
-    return gh("repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+    try:
+        ref = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    except CmdError:
+        return gh("repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+    return ref[len("origin/"):] if ref.startswith("origin/") else ref
 
 
 def needs_rebase(branch: str, dep: str | None, db: str) -> str:
@@ -269,6 +274,10 @@ def cmd_show(args):
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
+    if args.sync:
+        cfg = load_config()
+        _do_fetch(state, rs, cfg)
+        save_state(state)
     if not rs["branches"]:
         print("no tracked branches")
         return
@@ -311,9 +320,11 @@ def cmd_branch(args):
 
 
 def _do_fetch(state: dict, rs: dict, cfg: dict):
+    print("fetching git refs…", file=sys.stderr)
     git("fetch", "--all", "--prune", capture=False)
     db = default_branch()
 
+    print("listing open PRs…", file=sys.stderr)
     list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author", "title", "statusCheckRollup"]
     discovered = gh_json(
         ["pr", "list", "--state", "open", "--limit", "1000"],
@@ -325,7 +336,8 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
     for pr in discovered:
         require_keys(pr, list_fields, "gh pr list")
         head = pr["headRefName"]
-        if head not in rs["branches"]:
+        existing = rs["branches"].get(head)
+        if existing is None or existing.get("pr") != pr["number"]:
             base = pr["baseRefName"]
             author = pr["author"] or {}
             login = author.get("login") if isinstance(author, dict) else None
@@ -340,27 +352,34 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
             }
 
     view_fields = ["state", "baseRefName", "closedAt", "title", "statusCheckRollup"]
-    for name, entry in list(rs["branches"].items()):
-        if entry["pr"] is None:
-            continue
-        try:
-            data = gh_json(["pr", "view", str(entry["pr"])], view_fields)
-        except CmdError as e:
-            print(f"pr: warning: gh pr view {entry['pr']}: {e}", file=sys.stderr)
-            continue
-        if not isinstance(data, dict):
-            raise CmdError(f"gh pr view returned non-dict: {data!r}")
-        require_keys(data, view_fields, "gh pr view")
-        st = data["state"].lower()
-        entry["status"] = st
-        base = data["baseRefName"]
-        entry["depends_on"] = None if base == db else base
-        entry["title"] = data["title"]
-        entry["ci"] = _summarize_checks(data["statusCheckRollup"])
-        if st in ("merged", "closed"):
-            entry["closed_at"] = data["closedAt"]
-        else:
-            entry["closed_at"] = None
+    tracked = [(n, e) for n, e in rs["branches"].items() if e["pr"] is not None]
+    if tracked:
+        print(f"refreshing {len(tracked)} PR(s)…", file=sys.stderr)
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(8, len(tracked) or 1)) as ex:
+        futures = {ex.submit(gh_json, ["pr", "view", str(e["pr"])], view_fields): (n, e) for n, e in tracked}
+        for fut in as_completed(futures):
+            name, entry = futures[fut]
+            done += 1
+            try:
+                data = fut.result()
+            except CmdError as e:
+                print(f"pr: warning: gh pr view {entry['pr']}: {e}", file=sys.stderr)
+                continue
+            if not isinstance(data, dict):
+                raise CmdError(f"gh pr view returned non-dict: {data!r}")
+            require_keys(data, view_fields, "gh pr view")
+            st = data["state"].lower()
+            entry["status"] = st
+            base = data["baseRefName"]
+            entry["depends_on"] = None if base == db else base
+            entry["title"] = data["title"]
+            entry["ci"] = _summarize_checks(data["statusCheckRollup"])
+            if st in ("merged", "closed"):
+                entry["closed_at"] = data["closedAt"]
+            else:
+                entry["closed_at"] = None
+            print(f"refreshed PR #{entry['pr']} [{name}] ({done}/{len(tracked)})", file=sys.stderr)
 
     for entry in rs["branches"].values():
         if entry.get("depends_on") == db:
@@ -732,6 +751,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("show", help="display the PR tree (default)")
     s.add_argument("--all", action="store_true", help="include merged/closed PRs")
     s.add_argument("--org", action="store_true", help="Print the list of PRs as org-mode titles")
+    s.add_argument("--sync", action="store_true", help="refresh state from GitHub before rendering")
 
     b = sub.add_parser("branch", help="create a tracked branch with a dep")
     b.add_argument("name")
@@ -761,6 +781,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        argv = ["show"] + list(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd is None:
