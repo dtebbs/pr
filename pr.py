@@ -10,12 +10,9 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 STATE_PATH = Path.home() / ".pr.json"
-CONFIG_PATH = Path.home() / ".config" / "pr" / "config.json"
-DEFAULT_RETENTION_HOURS = 24
 STATE_VERSION = 1
 DEP_PREFIX_RE = re.compile(r"^\[dep #\d+\] ?")
 
@@ -59,10 +56,6 @@ def require_keys(obj: dict, keys: list[str], context: str):
         raise CmdError(f"gh JSON shape mismatch [{context}]: missing={missing} extra={extra}")
 
 
-def parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
 def load_state() -> dict:
     if not STATE_PATH.exists():
         return {"version": STATE_VERSION, "trees": {}}
@@ -81,19 +74,6 @@ def save_state(state: dict):
 
 def tree_state(state: dict, tree: str) -> dict:
     return state["trees"].setdefault(tree, {"branches": {}})
-
-
-def load_config() -> dict:
-    cfg = {"closed_retention_hours": DEFAULT_RETENTION_HOURS}
-    if CONFIG_PATH.exists():
-        try:
-            user = json.loads(CONFIG_PATH.read_text())
-        except json.JSONDecodeError:
-            print(f"pr: warning: {CONFIG_PATH} is malformed; using defaults", file=sys.stderr)
-            return cfg
-        if isinstance(user, dict):
-            cfg.update(user)
-    return cfg
 
 
 def current_branch() -> str:
@@ -275,8 +255,7 @@ def cmd_show(args):
     tree = current_tree()
     rs = tree_state(state, tree)
     if args.sync:
-        cfg = load_config()
-        _do_fetch(state, rs, cfg)
+        _do_fetch(state, rs)
         save_state(state)
     if not rs["branches"]:
         print("no tracked branches")
@@ -313,19 +292,18 @@ def cmd_branch(args):
         "pr": None,
         "depends_on": dep,
         "status": "no-pr",
-        "closed_at": None,
     }
     save_state(state)
     print(f"branch {args.name} tracked (dep: {dep or '<default>'})")
 
 
-def _do_fetch(state: dict, rs: dict, cfg: dict):
+def _do_fetch(state: dict, rs: dict):
     print("fetching git refs…", file=sys.stderr)
     git("fetch", "--all", "--prune", capture=False)
     db = default_branch()
 
     print("listing open PRs…", file=sys.stderr)
-    list_fields = ["number", "headRefName", "baseRefName", "state", "closedAt", "author", "title", "statusCheckRollup"]
+    list_fields = ["number", "headRefName", "baseRefName", "state", "author", "title", "statusCheckRollup"]
     discovered = gh_json(
         ["pr", "list", "--state", "open", "--limit", "1000"],
         list_fields,
@@ -345,14 +323,15 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
                 "pr": pr["number"],
                 "depends_on": None if base == db else base,
                 "status": pr["state"].lower(),
-                "closed_at": pr["closedAt"],
                 "external": login != me,
                 "title": pr["title"],
                 "ci": _summarize_checks(pr["statusCheckRollup"]),
             }
 
-    view_fields = ["state", "baseRefName", "closedAt", "title", "statusCheckRollup"]
-    tracked = [(n, e) for n, e in rs["branches"].items() if e["pr"] is not None]
+    view_fields = ["state", "baseRefName", "title", "statusCheckRollup"]
+    # Already-terminal PRs are dropped below, so there's nothing to refresh.
+    tracked = [(n, e) for n, e in rs["branches"].items()
+               if e["pr"] is not None and e.get("status") not in ("merged", "closed")]
     if tracked:
         print(f"refreshing {len(tracked)} PR(s)…", file=sys.stderr)
     done = 0
@@ -375,10 +354,6 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
             entry["depends_on"] = None if base == db else base
             entry["title"] = data["title"]
             entry["ci"] = _summarize_checks(data["statusCheckRollup"])
-            if st in ("merged", "closed"):
-                entry["closed_at"] = data["closedAt"]
-            else:
-                entry["closed_at"] = None
             print(f"refreshed PR #{entry['pr']} [{name}] ({done}/{len(tracked)})", file=sys.stderr)
 
     for entry in rs["branches"].values():
@@ -394,15 +369,9 @@ def _do_fetch(state: dict, rs: dict, cfg: dict):
             continue
         del rs["branches"][name]
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg["closed_retention_hours"])
-    to_drop: list[str] = []
-    for name, entry in rs["branches"].items():
-        if entry["pr"] is None:
-            continue
-        if entry["status"] in ("merged", "closed") and entry["closed_at"]:
-            if parse_iso(entry["closed_at"]) <= cutoff:
-                to_drop.append(name)
-    for name in to_drop:
+    # A merged/closed PR is done — drop it immediately, no grace window. If
+    # it's later reopened, `pr list --state open` above re-discovers it.
+    for name in [n for n, e in rs["branches"].items() if e.get("status") in ("merged", "closed")]:
         del rs["branches"][name]
 
 
@@ -410,8 +379,7 @@ def cmd_fetch(args):
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
-    cfg = load_config()
-    _do_fetch(state, rs, cfg)
+    _do_fetch(state, rs)
     save_state(state)
 
 
@@ -433,8 +401,7 @@ def cmd_create(args):
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
-    cfg = load_config()
-    _do_fetch(state, rs, cfg)
+    _do_fetch(state, rs)
 
     cur = current_branch()
     existing = rs["branches"].get(cur)
@@ -475,7 +442,6 @@ def cmd_create(args):
         "pr": pr_num,
         "depends_on": dep,
         "status": "open",
-        "closed_at": None,
     }
     save_state(state)
     print(f"created PR #{pr_num}: {title}")
@@ -515,7 +481,6 @@ def cmd_target(args):
             "pr": None,
             "depends_on": new_dep,
             "status": "no-pr",
-            "closed_at": None,
         }
     else:
         entry["depends_on"] = new_dep
@@ -566,20 +531,31 @@ def cmd_update(args):
 
 
 def cmd_review(args):
-    cur = current_branch()
+    branch = args.branch or current_branch()
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
-    entry = rs["branches"].get(cur)
+    entry = rs["branches"].get(branch)
     parent = (entry or {}).get("depends_on") or default_branch()
+    pr_num = (entry or {}).get("pr")
 
-    diff = git("diff", "--no-ext-diff", f"origin/{parent}..HEAD")
+    # Pull the diff from the server so the review is independent of the local
+    # checkout — you can switch branches while it runs.
+    if pr_num is not None:
+        diff = gh("pr", "diff", str(pr_num))
+        source = f"PR #{pr_num} (branch `{branch}` vs parent `{parent}`)"
+    else:
+        # No PR tracked: diff the remote refs directly (still not local HEAD).
+        git("fetch", "--quiet", "origin", branch, parent, capture=False)
+        diff = git("diff", "--no-ext-diff", f"origin/{parent}...origin/{branch}")
+        source = f"branch `{branch}` vs parent `origin/{parent}`"
+
     if not diff.strip():
-        print(f"no diff between {cur} and origin/{parent}")
+        print(f"no diff for {source}")
         return
 
     prompt = (
-        f"Review this git diff (branch `{cur}` vs parent `origin/{parent}`). "
+        f"Review this git diff ({source}). "
         "If there are no real issues, respond with exactly: No issues.\n"
         "Only flag actual bugs, correctness problems, or security issues. "
         "Do not suggest stylistic improvements or speculative concerns. "
@@ -736,6 +712,24 @@ def cmd_automerge(args):
     branch = args.branch or current_branch()
     db = default_branch()
 
+    if args.single:
+        listed = gh_json(
+            ["pr", "list", "--head", branch, "--state", "open"],
+            ["number", "baseRefName"],
+        )
+        if not isinstance(listed, list):
+            raise CmdError(f"gh pr list returned non-list: {listed!r}")
+        if not listed:
+            die(f"no open PR for branch {branch!r}")
+        if len(listed) > 1:
+            nums = ", ".join(f"#{p['number']}" for p in listed)
+            die(f"multiple open PRs for branch {branch!r}: {nums}")
+        pr_num = listed[0]["number"]
+        base = listed[0]["baseRefName"]
+        print(f"merging PR #{pr_num} into {base} (no recurse)")
+        _automerge_one(pr_num, base)
+        return
+
     print(f"resolving merge chain for {branch}…")
     chain = _resolve_merge_chain(branch, db)
     print("chain (ancestor-first): " + ", ".join(f"#{n}" for n in chain))
@@ -772,10 +766,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("update", help="sync current PR's title prefix with its dep state")
 
-    sub.add_parser("review", help="run claude (read-only) over the diff vs the branch's parent")
+    r = sub.add_parser("review", help="run claude (read-only) over a branch's server diff vs its parent")
+    r.add_argument("branch", nargs="?", help="branch to review (defaults to current branch)")
 
     am = sub.add_parser("automerge", help="poll a branch's PR and merge when CI passes")
     am.add_argument("branch", nargs="?", help="branch to merge (defaults to current branch)")
+    am.add_argument("--single", action="store_true", help="merge only the target PR into its current base, without recursing into ancestor PRs")
 
     return p
 
