@@ -543,16 +543,23 @@ def cmd_review(args):
     # checkout — you can switch branches while it runs.
     if pr_num is not None:
         diff = gh("pr", "diff", str(pr_num))
-        source = f"PR #{pr_num} (branch `{branch}` vs parent `{parent}`)"
+        # Report the PR's actual base on the server, which may differ from the
+        # locally-tracked parent.
+        fields = ["baseRefName", "headRefName"]
+        info = gh_json(["pr", "view", str(pr_num)], fields)
+        require_keys(info, fields, "gh pr view")
+        source = f"PR #{pr_num} (`{info['headRefName']}` vs base `{info['baseRefName']}`)"
     else:
         # No PR tracked: diff the remote refs directly (still not local HEAD).
         git("fetch", "--quiet", "origin", branch, parent, capture=False)
         diff = git("diff", "--no-ext-diff", f"origin/{parent}...origin/{branch}")
-        source = f"branch `{branch}` vs parent `origin/{parent}`"
+        source = f"branch `{branch}` vs base `origin/{parent}`"
 
     if not diff.strip():
         print(f"no diff for {source}")
         return
+
+    print(f"reviewing {source}")
 
     prompt = (
         f"Review this git diff ({source}). "
