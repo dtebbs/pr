@@ -579,12 +579,17 @@ def cmd_review(args):
             f"Previous review (context only):\n{prior_review.strip()}\n\n"
         )
 
+    extra_block = ""
+    if args.prompt and args.prompt.strip():
+        extra_block = f"Additional instructions for this review:\n{args.prompt.strip()}\n\n"
+
     prompt = (
         f"Review this git diff ({source}). "
         "If there are no real issues, respond with exactly: No issues.\n"
         "Only flag actual bugs, correctness problems, or security issues. "
         "Do not suggest stylistic improvements or speculative concerns. "
         "You may read files in this repository for context.\n\n"
+        f"{extra_block}"
         f"{context_block}"
         f"Diff:\n{diff}\n"
     )
@@ -633,6 +638,10 @@ def cmd_post_review(args):
 
 
 _AUTOMERGE_POLL_SECONDS = 20
+# An empty statusCheckRollup is ambiguous: it can mean "no CI is configured" or
+# "CI hasn't registered yet" (common in the seconds after a PR opens or is
+# rebased). Only merge a PR as no-CI once the rollup has stayed empty this long.
+_AUTOMERGE_NO_CI_GRACE_SECONDS = 90
 
 
 def _resolve_merge_chain(branch: str, db: str) -> list[int]:
@@ -718,6 +727,7 @@ def _automerge_one(pr_num: int, db: str):
         gh("pr", "edit", str(pr_num), "--base", db)
 
     rebased = False
+    no_ci_since = None
     while True:
         data = gh_json(["pr", "view", str(pr_num)], view_fields)
         if not isinstance(data, dict):
@@ -749,10 +759,41 @@ def _automerge_one(pr_num: int, db: str):
             except CmdError as e:
                 die(f"failed to rebase PR #{pr_num}: {e}")
             rebased = True
+            no_ci_since = None  # rebase re-triggers CI; restart the no-CI grace clock
             time.sleep(_AUTOMERGE_POLL_SECONDS)
             continue
 
-        if ci in ("pass", "none") and merge_state in ("CLEAN", "UNSTABLE", "HAS_HOOKS"):
+        mergeable_state = merge_state in ("CLEAN", "UNSTABLE", "HAS_HOOKS")
+        should_merge = False
+        if mergeable_state and ci == "pass":
+            should_merge = True
+        elif mergeable_state and ci == "none":
+            # Empty rollup: either no CI is configured, or CI hasn't registered
+            # yet. Only merge once it has stayed empty past the grace window;
+            # otherwise keep polling for checks to appear.
+            if no_ci_since is None:
+                no_ci_since = time.monotonic()
+            waited = time.monotonic() - no_ci_since
+            if waited >= _AUTOMERGE_NO_CI_GRACE_SECONDS:
+                print(
+                    f"pr: warning: PR #{pr_num} still has no CI checks after "
+                    f"{int(waited)}s — treating as no-CI and merging",
+                    file=sys.stderr,
+                )
+                should_merge = True
+            else:
+                print(
+                    f"PR #{pr_num} has no CI checks yet; waiting up to "
+                    f"{_AUTOMERGE_NO_CI_GRACE_SECONDS}s for them to register…"
+                )
+                time.sleep(_AUTOMERGE_POLL_SECONDS)
+                continue
+        else:
+            # Checks are present but not yet passing, or the merge state isn't
+            # ready; the empty-rollup grace clock doesn't apply.
+            no_ci_since = None
+
+        if should_merge:
             cur_title = data["title"]
             stripped = DEP_PREFIX_RE.sub("", cur_title)
             if stripped != cur_title:
@@ -829,6 +870,7 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("review", help="run claude (read-only) over a branch's server diff vs its parent")
     r.add_argument("branch", nargs="?", help="branch to review (defaults to current branch)")
     r.add_argument("--show", action="store_true", help="print the last stored review instead of running a new one")
+    r.add_argument("-p", "--prompt", help="extra instructions to append to the review prompt")
 
     pr_post = sub.add_parser("post-review", help="post a branch's stored review as a PR comment")
     pr_post.add_argument("branch", nargs="?", help="branch whose stored review to post (defaults to current branch)")
