@@ -152,6 +152,7 @@ _ANSI_YELLOW = "33"
 _ANSI_GREEN = "32"
 _ANSI_ORANGE = "38;5;208"
 _ANSI_WHITE = "37"
+_ANSI_GREY = "90"
 
 
 def _ansi(text: str, code: str) -> str:
@@ -186,6 +187,7 @@ def render_tree(visible: dict, db: str, rebase_fn, current: str | None = None) -
             "name": f"[{name}]",
             "external": bool(entry.get("external")),
             "current": name == current,
+            "draft": bool(entry.get("draft")),
             "pr": fmt_pr(entry),
             "ci": entry.get("ci") or "none",
             "rebase": rebase,
@@ -217,27 +219,41 @@ def render_tree(visible: dict, db: str, rebase_fn, current: str | None = None) -
     max_lead_name = max((len(r["lead"]) + len(r["name"]) for r in all_rows), default=0)
     widths = {c: max((len(r[c]) for r in all_rows), default=0) for c in ("pr", "rebase")}
 
+    ci_glyphs = {"pass": "✓", "fail": "✗", "pending": "?"}
+    ci_colors = {"pass": _ANSI_GREEN, "fail": _ANSI_RED, "pending": _ANSI_YELLOW}
+
     def _ci_icon(ci: str) -> str:
-        if ci == "pass":
-            return _ansi("✓", _ANSI_GREEN)
-        if ci == "fail":
-            return _ansi("✗", _ANSI_RED)
-        if ci == "pending":
-            return _ansi("?", _ANSI_YELLOW)
-        return " "
+        glyph = ci_glyphs.get(ci, " ")
+        color = ci_colors.get(ci)
+        return _ansi(glyph, color) if color else glyph
 
     def _format(r: dict) -> str:
+        pad_name = " " * (max_lead_name - len(r["lead"]) - len(r["name"]))
+        pr_pad = " " * (widths["pr"] - len(r["pr"]))
+        rebase_pad = " " * (widths["rebase"] - len(r["rebase"]))
+        if r["draft"]:
+            # Draft PRs render as one uniformly greyed line, dropping the
+            # per-cell colors so the whole row reads as muted.
+            segs = [
+                r["lead"], r["name"], pad_name,
+                "  ", r["pr"], pr_pad,
+                "  ", ci_glyphs.get(r["ci"], " "),
+                "  ", r["rebase"], rebase_pad,
+            ]
+            if r["title"]:
+                segs.append("  " + r["title"])
+            return _ansi("".join(segs).rstrip(), _ANSI_GREY)
         name_color = _ANSI_WHITE if r["external"] else _ANSI_RED
         if r["current"]:
             name_color = f"1;{name_color}"
         parts = [
             r["lead"],
             _ansi(r["name"], name_color),
-            " " * (max_lead_name - len(r["lead"]) - len(r["name"])),
+            pad_name,
         ]
-        parts.append("  " + _ansi(r["pr"], _ANSI_YELLOW) + " " * (widths["pr"] - len(r["pr"])))
+        parts.append("  " + _ansi(r["pr"], _ANSI_YELLOW) + pr_pad)
         parts.append("  " + _ci_icon(r["ci"]))
-        parts.append("  " + _color_rebase(r["rebase"]) + " " * (widths["rebase"] - len(r["rebase"])))
+        parts.append("  " + _color_rebase(r["rebase"]) + rebase_pad)
         if r["title"]:
             parts.append("  " + r["title"])
         return "".join(parts).rstrip()
@@ -303,7 +319,7 @@ def _do_fetch(state: dict, rs: dict):
     db = default_branch()
 
     print("listing open PRs…", file=sys.stderr)
-    list_fields = ["number", "headRefName", "baseRefName", "state", "author", "title", "statusCheckRollup"]
+    list_fields = ["number", "headRefName", "baseRefName", "state", "author", "title", "statusCheckRollup", "isDraft"]
     discovered = gh_json(
         ["pr", "list", "--state", "open", "--limit", "1000"],
         list_fields,
@@ -326,9 +342,10 @@ def _do_fetch(state: dict, rs: dict):
                 "external": login != me,
                 "title": pr["title"],
                 "ci": _summarize_checks(pr["statusCheckRollup"]),
+                "draft": bool(pr["isDraft"]),
             }
 
-    view_fields = ["state", "baseRefName", "title", "statusCheckRollup"]
+    view_fields = ["state", "baseRefName", "title", "statusCheckRollup", "isDraft"]
     # Already-terminal PRs are dropped below, so there's nothing to refresh.
     tracked = [(n, e) for n, e in rs["branches"].items()
                if e["pr"] is not None and e.get("status") not in ("merged", "closed")]
@@ -354,6 +371,7 @@ def _do_fetch(state: dict, rs: dict):
             entry["depends_on"] = None if base == db else base
             entry["title"] = data["title"]
             entry["ci"] = _summarize_checks(data["statusCheckRollup"])
+            entry["draft"] = bool(data["isDraft"])
             print(f"refreshed PR #{entry['pr']} [{name}] ({done}/{len(tracked)})", file=sys.stderr)
 
     for entry in rs["branches"].values():
@@ -442,6 +460,7 @@ def cmd_create(args):
         "pr": pr_num,
         "depends_on": dep,
         "status": "open",
+        "draft": not args.ready,
     }
     save_state(state)
     print(f"created PR #{pr_num}: {title}")
@@ -505,6 +524,32 @@ def cmd_rebase(args):
         sys.exit(rc)
 
 
+def cmd_diff(args):
+    branch = args.branch or current_branch()
+    state = load_state()
+    rs = tree_state(state, current_tree())
+    entry = rs["branches"].get(branch)
+    parent = (entry or {}).get("depends_on") or default_branch()
+    # Triple-dot: only the branch's own commits, not the ones its base gained
+    # since they diverged.
+    cmd = ["git", "diff", "--no-ext-diff", f"origin/{parent}...{branch}", *args.git_args]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        sys.exit(rc)
+
+
+def cmd_checkout(args):
+    target = args.target
+    if target.isdigit():
+        fields = ["headRefName"]
+        info = gh_json(["pr", "view", target], fields)
+        require_keys(info, fields, "gh pr view")
+        branch = info["headRefName"]
+    else:
+        branch = target
+    git("checkout", branch, capture=False)
+
+
 def cmd_update(args):
     state = load_state()
     tree = current_tree()
@@ -531,10 +576,36 @@ def cmd_update(args):
 
 
 def cmd_review(args):
-    branch = args.branch or current_branch()
+    branches = args.branches or [current_branch()]
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
+    for i, branch in enumerate(branches):
+        if i:
+            print()
+        if len(branches) > 1:
+            print(f"=== {branch} ===")
+        _review_branch(state, rs, tree, branch, args)
+
+
+def repo_instructions(tree: str) -> str:
+    """Contents of the checkout's CLAUDE.md, plus AGENTS.md when CLAUDE.md refers to it."""
+    root = Path(tree)
+    names = ["CLAUDE.md"]
+    claude_md = root / "CLAUDE.md"
+    if claude_md.is_file() and "AGENTS.md" in claude_md.read_text():
+        names.append("AGENTS.md")
+    blocks = []
+    for name in names:
+        path = root / name
+        if path.is_file():
+            text = path.read_text().strip()
+            if text:
+                blocks.append(f"Contents of {name}:\n{text}\n")
+    return "\n".join(blocks)
+
+
+def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
     entry = rs["branches"].get(branch)
     parent = (entry or {}).get("depends_on") or default_branch()
     pr_num = (entry or {}).get("pr")
@@ -583,6 +654,15 @@ def cmd_review(args):
     if args.prompt and args.prompt.strip():
         extra_block = f"Additional instructions for this review:\n{args.prompt.strip()}\n\n"
 
+    instructions_block = ""
+    instructions = repo_instructions(tree)
+    if instructions:
+        instructions_block = (
+            "The repository's instruction files are included below. Follow them "
+            "and check the diff against any conventions they describe.\n\n"
+            f"{instructions}\n"
+        )
+
     prompt = (
         f"Review this git diff ({source}). "
         "If there are no real issues, respond with exactly: No issues.\n"
@@ -590,16 +670,20 @@ def cmd_review(args):
         "Do not suggest stylistic improvements or speculative concerns. "
         "You may read files in this repository for context.\n\n"
         f"{extra_block}"
+        f"{instructions_block}"
         f"{context_block}"
         f"Diff:\n{diff}\n"
     )
 
+    # Run from the repo root so claude also picks up CLAUDE.md on its own,
+    # regardless of which subdirectory `pr review` was invoked from.
     # Capture stdout so the review can be persisted; stderr still streams.
     proc = subprocess.run(
         ["claude", "-p", "--tools", "Read,Glob,Grep"],
         input=prompt,
         text=True,
         stdout=subprocess.PIPE,
+        cwd=tree,
     )
     if proc.returncode != 0:
         die(f"claude exited with code {proc.returncode}", code=proc.returncode)
@@ -635,6 +719,39 @@ def cmd_post_review(args):
     body = f"🤖 Automated review generated by Claude:\n\n{review.strip()}"
     gh("pr", "comment", str(pr_num), "--body", body, capture=False)
     print(f"posted stored review as a comment on PR #{pr_num}")
+
+
+def _resolve_tracked_pr(branch: str):
+    """Return (state, rs, entry, pr_num) for a tracked branch with an open PR,
+    or die with a helpful message."""
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    entry = rs["branches"].get(branch)
+    if entry is None:
+        die(f"branch {branch} is not tracked")
+    pr_num = entry.get("pr")
+    if pr_num is None:
+        die(f"branch {branch} has no PR")
+    return state, rs, entry, pr_num
+
+
+def cmd_ready(args):
+    branch = args.branch or current_branch()
+    state, _rs, entry, pr_num = _resolve_tracked_pr(branch)
+    gh("pr", "ready", str(pr_num), capture=False)
+    entry["draft"] = False
+    save_state(state)
+    print(f"marked PR #{pr_num} ready for review")
+
+
+def cmd_draft(args):
+    branch = args.branch or current_branch()
+    state, _rs, entry, pr_num = _resolve_tracked_pr(branch)
+    gh("pr", "ready", str(pr_num), "--undo", capture=False)
+    entry["draft"] = True
+    save_state(state)
+    print(f"converted PR #{pr_num} to draft")
 
 
 _AUTOMERGE_POLL_SECONDS = 20
@@ -865,15 +982,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("rebase", help="rebase current branch onto its dep")
 
+    d = sub.add_parser("diff", help="git diff a branch against its base (flags after `--` go to git diff)")
+    d.add_argument("branch", nargs="?", help="branch to diff (defaults to current branch)")
+
+    co = sub.add_parser("checkout", help="check out a branch or PR number")
+    co.add_argument("target", help="branch name or PR number")
+
     sub.add_parser("update", help="sync current PR's title prefix with its dep state")
 
-    r = sub.add_parser("review", help="run claude (read-only) over a branch's server diff vs its parent")
-    r.add_argument("branch", nargs="?", help="branch to review (defaults to current branch)")
+    r = sub.add_parser("review", help="run claude (read-only) over each branch's server diff vs its parent")
+    r.add_argument("branches", nargs="*", metavar="branch", help="branches to review (defaults to current branch)")
     r.add_argument("--show", action="store_true", help="print the last stored review instead of running a new one")
     r.add_argument("-p", "--prompt", help="extra instructions to append to the review prompt")
 
     pr_post = sub.add_parser("post-review", help="post a branch's stored review as a PR comment")
     pr_post.add_argument("branch", nargs="?", help="branch whose stored review to post (defaults to current branch)")
+
+    rdy = sub.add_parser("ready", help="mark a branch's PR as ready for review")
+    rdy.add_argument("branch", nargs="?", help="branch whose PR to mark ready (defaults to current branch)")
+
+    drf = sub.add_parser("draft", help="convert a branch's PR back to draft")
+    drf.add_argument("branch", nargs="?", help="branch whose PR to convert to draft (defaults to current branch)")
 
     am = sub.add_parser("automerge", help="poll a branch's PR and merge when CI passes")
     am.add_argument("branch", nargs="?", help="branch to merge (defaults to current branch)")
@@ -887,10 +1016,17 @@ def main(argv: list[str] | None = None):
         argv = sys.argv[1:]
     if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
         argv = ["show"] + list(argv)
+    git_args: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, git_args = argv[:i], argv[i + 1:]
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd is None:
         args = parser.parse_args(["show"])
+    if git_args and args.cmd != "diff":
+        die(f"`--` passthrough args are only supported by `pr diff`, not `pr {args.cmd}`")
+    args.git_args = git_args
     handlers = {
         "show": cmd_show,
         "branch": cmd_branch,
@@ -898,9 +1034,13 @@ def main(argv: list[str] | None = None):
         "fetch": cmd_fetch,
         "target": cmd_target,
         "rebase": cmd_rebase,
+        "diff": cmd_diff,
+        "checkout": cmd_checkout,
         "update": cmd_update,
         "review": cmd_review,
         "post-review": cmd_post_review,
+        "ready": cmd_ready,
+        "draft": cmd_draft,
         "automerge": cmd_automerge,
     }
     try:
