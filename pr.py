@@ -619,7 +619,8 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
         return
 
     # Pull the diff from the server so the review is independent of the local
-    # checkout — you can switch branches while it runs.
+    # checkout — you can switch branches while it runs. The review skill fetches
+    # it again with the same command; this copy only serves to skip empty diffs.
     if pr_num is not None:
         diff = gh("pr", "diff", str(pr_num))
         # Report the PR's actual base on the server, which may differ from the
@@ -628,11 +629,15 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
         info = gh_json(["pr", "view", str(pr_num)], fields)
         require_keys(info, fields, "gh pr view")
         source = f"PR #{pr_num} (`{info['headRefName']}` vs base `{info['baseRefName']}`)"
+        target = str(pr_num)
+        diff_cmd = f"gh pr diff {pr_num}"
     else:
         # No PR tracked: diff the remote refs directly (still not local HEAD).
         git("fetch", "--quiet", "origin", branch, parent, capture=False)
         diff = git("diff", "--no-ext-diff", f"origin/{parent}...origin/{branch}")
         source = f"branch `{branch}` vs base `origin/{parent}`"
+        target = f"origin/{branch}"
+        diff_cmd = f"git diff --no-ext-diff origin/{parent}...origin/{branch}"
 
     if not diff.strip():
         print(f"no diff for {source}")
@@ -658,28 +663,52 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
     instructions = repo_instructions(tree)
     if instructions:
         instructions_block = (
-            "The repository's instruction files are included below. Follow them "
-            "and check the diff against any conventions they describe.\n\n"
+            "Check every hunk against the conventions in the repository's "
+            "instruction files, included below, and report each violation as a "
+            "finding.\n\n"
             f"{instructions}\n"
         )
 
+    # The first line invokes claude's bundled code-review skill; the rest of the
+    # prompt reaches the model as ordinary instructions alongside it.
     prompt = (
-        f"Review this git diff ({source}). "
-        "If there are no real issues, respond with exactly: No issues.\n"
-        "Only flag actual bugs, correctness problems, or security issues. "
-        "Do not suggest stylistic improvements or speculative concerns. "
-        "You may read files in this repository for context.\n\n"
+        f"/code-review {args.level} {target} --max-findings all\n\n"
+        f"Target: {source}. Obtain the diff with `{diff_cmd}` and review exactly "
+        "that diff. Do not derive the base from the local checkout, which may be "
+        "on a different branch.\n\n"
+        "Be thorough rather than conservative. Examine every hunk, and read the "
+        "surrounding code and callers whenever a change's correctness depends on "
+        "them. Report a finding whenever you can describe a concrete way it "
+        "fails, even if you are not certain the path is reachable, and state "
+        "your confidence rather than withholding it. Regressions, silent error "
+        "handling, and missing or inadequate tests all count.\n\n"
         f"{extra_block}"
         f"{instructions_block}"
         f"{context_block}"
-        f"Diff:\n{diff}\n"
+        "Write the complete review as your final message, in markdown suitable "
+        "for posting as a PR comment: one bullet per finding giving file:line, "
+        "what is wrong, how it fails, and your confidence, followed by a short "
+        "list of what you checked and found clean. Do not reply with only a "
+        "one-line verdict.\n"
     )
 
     # Run from the repo root so claude also picks up CLAUDE.md on its own,
     # regardless of which subdirectory `pr review` was invoked from.
+    # Plan mode keeps the session read-only while still allowing the git and
+    # gh commands the skill needs; anything that would prompt is denied.
     # Capture stdout so the review can be persisted; stderr still streams.
     proc = subprocess.run(
-        ["claude", "-p", "--tools", "Read,Glob,Grep"],
+        [
+            "claude",
+            "-p",
+            "--permission-mode",
+            "plan",
+            "--permission-prompts",
+            "none",
+            "--allowedTools",
+            "Bash(gh pr diff:*),Bash(gh pr view:*)",
+            "--strict-mcp-config",
+        ],
         input=prompt,
         text=True,
         stdout=subprocess.PIPE,
@@ -990,10 +1019,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("update", help="sync current PR's title prefix with its dep state")
 
-    r = sub.add_parser("review", help="run claude (read-only) over each branch's server diff vs its parent")
+    r = sub.add_parser("review", help="run claude's code-review skill (read-only) over each branch's server diff vs its parent")
     r.add_argument("branches", nargs="*", metavar="branch", help="branches to review (defaults to current branch)")
     r.add_argument("--show", action="store_true", help="print the last stored review instead of running a new one")
     r.add_argument("-p", "--prompt", help="extra instructions to append to the review prompt")
+    r.add_argument(
+        "--level",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default="high",
+        help="code-review effort: higher levels report more findings and run more reviewer agents (default: high)",
+    )
 
     pr_post = sub.add_parser("post-review", help="post a branch's stored review as a PR comment")
     pr_post.add_argument("branch", nargs="?", help="branch whose stored review to post (defaults to current branch)")
