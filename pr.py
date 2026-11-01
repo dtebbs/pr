@@ -1318,6 +1318,9 @@ def cmd_draft(args):
 
 
 _AUTOMERGE_POLL_SECONDS = 20
+# When a gh or git call fails (network down, laptop just woke up), wait this
+# long and poll again instead of giving up.
+_AUTOMERGE_RETRY_SECONDS = 180
 # An empty statusCheckRollup is ambiguous: it can mean "no CI is configured" or
 # "CI hasn't registered yet" (common in the seconds after a PR opens or is
 # rebased). Only merge a PR as no-CI once the rollup has stayed empty this long.
@@ -1393,100 +1396,108 @@ def _strip_dep_prefix_on_dependents(merged_head: str):
 
 
 def _automerge_one(pr_num: int, db: str):
+    """Poll PR `pr_num` until it is merged. A failed gh or git call is reported
+    and retried after a pause, so an outage or a sleeping laptop only delays it."""
+    st = {"rebased": False, "no_ci_since": None}
+    while True:
+        try:
+            if _automerge_step(pr_num, db, st):
+                return
+        except CmdError as e:
+            print(f"pr: warning: {e}; retrying in {_AUTOMERGE_RETRY_SECONDS}s", file=sys.stderr)
+            time.sleep(_AUTOMERGE_RETRY_SECONDS)
+            continue
+        time.sleep(_AUTOMERGE_POLL_SECONDS)
+
+
+def _automerge_step(pr_num: int, db: str, st: dict) -> bool:
+    """One poll of PR `pr_num`: retarget, rebase or merge it as needed.
+    Returns True once the PR is merged, False to poll again."""
     view_fields = ["state", "statusCheckRollup", "mergeStateStatus", "baseRefName", "title", "headRefName"]
+    data = gh_json(["pr", "view", str(pr_num)], view_fields)
+    if not isinstance(data, dict):
+        raise CmdError(f"gh pr view returned non-dict: {data!r}")
+    require_keys(data, view_fields, "gh pr view")
 
-    snapshot = gh_json(["pr", "view", str(pr_num)], view_fields)
-    if not isinstance(snapshot, dict):
-        raise CmdError(f"gh pr view returned non-dict: {snapshot!r}")
-    require_keys(snapshot, view_fields, "gh pr view")
-    if (snapshot["state"] or "").upper() != "OPEN":
-        die(f"PR #{pr_num} is not open (state={snapshot['state']})")
+    state = (data["state"] or "").upper()
+    merge_state = (data["mergeStateStatus"] or "").upper()
+    ci = _summarize_checks(data["statusCheckRollup"])
 
-    if snapshot["baseRefName"] != db:
+    if state == "MERGED":
+        # Either merged by hand, or our merge went through but its reply was lost.
+        print(f"PR #{pr_num} is already merged")
+        _strip_dep_prefix_on_dependents(data["headRefName"])
+        return True
+    if state != "OPEN":
+        die(f"PR #{pr_num} is not open (state={state})")
+
+    if data["baseRefName"] != db:
         print(f"retargeting PR #{pr_num} base to {db}")
         gh("pr", "edit", str(pr_num), "--base", db)
+        data["baseRefName"] = db
 
-    rebased = False
-    no_ci_since = None
-    while True:
-        data = gh_json(["pr", "view", str(pr_num)], view_fields)
-        if not isinstance(data, dict):
-            raise CmdError(f"gh pr view returned non-dict: {data!r}")
-        require_keys(data, view_fields, "gh pr view")
+    if merge_state == "DIRTY":
+        die(f"PR #{pr_num} has merge conflicts — can't rebase")
+    if merge_state == "BLOCKED":
+        die(f"PR #{pr_num} is blocked (required reviews or branch protection)")
+    if ci == "fail":
+        die(f"PR #{pr_num} has failing CI")
 
-        state = (data["state"] or "").upper()
-        merge_state = (data["mergeStateStatus"] or "").upper()
-        ci = _summarize_checks(data["statusCheckRollup"])
+    if merge_state == "BEHIND" or _is_behind(data["baseRefName"], data["headRefName"]):
+        if st["rebased"]:
+            die(f"PR #{pr_num} still behind after rebase attempt")
+        print(f"pr: warning: PR #{pr_num} is behind {db} — rebasing on server", file=sys.stderr)
+        try:
+            gh("pr", "update-branch", str(pr_num), "--rebase", capture=False)
+        except CmdError as e:
+            die(f"failed to rebase PR #{pr_num}: {e}")
+        st["rebased"] = True
+        st["no_ci_since"] = None  # rebase re-triggers CI; restart the no-CI grace clock
+        return False
 
-        if state != "OPEN":
-            die(f"PR #{pr_num} is no longer open (state={state})")
-        if merge_state == "DIRTY":
-            die(f"PR #{pr_num} has merge conflicts — can't rebase")
-        if merge_state == "BLOCKED":
-            die(f"PR #{pr_num} is blocked (required reviews or branch protection)")
-        if ci == "fail":
-            die(f"PR #{pr_num} has failing CI")
-
-        behind = merge_state == "BEHIND"
-        if not behind:
-            behind = _is_behind(data["baseRefName"], data["headRefName"])
-        if behind:
-            if rebased:
-                die(f"PR #{pr_num} still behind after rebase attempt")
-            print(f"pr: warning: PR #{pr_num} is behind {db} — rebasing on server", file=sys.stderr)
-            try:
-                gh("pr", "update-branch", str(pr_num), "--rebase", capture=False)
-            except CmdError as e:
-                die(f"failed to rebase PR #{pr_num}: {e}")
-            rebased = True
-            no_ci_since = None  # rebase re-triggers CI; restart the no-CI grace clock
-            time.sleep(_AUTOMERGE_POLL_SECONDS)
-            continue
-
-        mergeable_state = merge_state in ("CLEAN", "UNSTABLE", "HAS_HOOKS")
-        should_merge = False
-        if mergeable_state and ci == "pass":
+    mergeable_state = merge_state in ("CLEAN", "UNSTABLE", "HAS_HOOKS")
+    should_merge = False
+    if mergeable_state and ci == "pass":
+        should_merge = True
+    elif mergeable_state and ci == "none":
+        # Empty rollup: either no CI is configured, or CI hasn't registered
+        # yet. Only merge once it has stayed empty past the grace window;
+        # otherwise keep polling for checks to appear.
+        if st["no_ci_since"] is None:
+            st["no_ci_since"] = time.monotonic()
+        waited = time.monotonic() - st["no_ci_since"]
+        if waited >= _AUTOMERGE_NO_CI_GRACE_SECONDS:
+            print(
+                f"pr: warning: PR #{pr_num} still has no CI checks after "
+                f"{int(waited)}s — treating as no-CI and merging",
+                file=sys.stderr,
+            )
             should_merge = True
-        elif mergeable_state and ci == "none":
-            # Empty rollup: either no CI is configured, or CI hasn't registered
-            # yet. Only merge once it has stayed empty past the grace window;
-            # otherwise keep polling for checks to appear.
-            if no_ci_since is None:
-                no_ci_since = time.monotonic()
-            waited = time.monotonic() - no_ci_since
-            if waited >= _AUTOMERGE_NO_CI_GRACE_SECONDS:
-                print(
-                    f"pr: warning: PR #{pr_num} still has no CI checks after "
-                    f"{int(waited)}s — treating as no-CI and merging",
-                    file=sys.stderr,
-                )
-                should_merge = True
-            else:
-                print(
-                    f"PR #{pr_num} has no CI checks yet; waiting up to "
-                    f"{_AUTOMERGE_NO_CI_GRACE_SECONDS}s for them to register…"
-                )
-                time.sleep(_AUTOMERGE_POLL_SECONDS)
-                continue
         else:
-            # Checks are present but not yet passing, or the merge state isn't
-            # ready; the empty-rollup grace clock doesn't apply.
-            no_ci_since = None
+            print(
+                f"PR #{pr_num} has no CI checks yet; waiting up to "
+                f"{_AUTOMERGE_NO_CI_GRACE_SECONDS}s for them to register…"
+            )
+            return False
+    else:
+        # Checks are present but not yet passing, or the merge state isn't
+        # ready; the empty-rollup grace clock doesn't apply.
+        st["no_ci_since"] = None
 
-        if should_merge:
-            cur_title = data["title"]
-            stripped = DEP_PREFIX_RE.sub("", cur_title)
-            if stripped != cur_title:
-                print(f"stripping dep prefix from PR #{pr_num}")
-                gh("pr", "edit", str(pr_num), "--title", stripped)
-            print(f"merging PR #{pr_num}…")
-            gh("pr", "merge", str(pr_num), "--merge", capture=False)
-            print(f"merged PR #{pr_num}")
-            _strip_dep_prefix_on_dependents(data["headRefName"])
-            return
+    if should_merge:
+        cur_title = data["title"]
+        stripped = DEP_PREFIX_RE.sub("", cur_title)
+        if stripped != cur_title:
+            print(f"stripping dep prefix from PR #{pr_num}")
+            gh("pr", "edit", str(pr_num), "--title", stripped)
+        print(f"merging PR #{pr_num}…")
+        gh("pr", "merge", str(pr_num), "--merge", capture=False)
+        print(f"merged PR #{pr_num}")
+        _strip_dep_prefix_on_dependents(data["headRefName"])
+        return True
 
-        print(f"PR #{pr_num} CI: {ci}, merge: {merge_state}; sleeping {_AUTOMERGE_POLL_SECONDS}s…")
-        time.sleep(_AUTOMERGE_POLL_SECONDS)
+    print(f"PR #{pr_num} CI: {ci}, merge: {merge_state}; sleeping {_AUTOMERGE_POLL_SECONDS}s…")
+    return False
 
 
 def cmd_automerge(args):

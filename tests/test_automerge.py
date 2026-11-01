@@ -344,3 +344,98 @@ def test_automerge_polls_until_ci_passes(monkeypatch):
 
     assert len(sleeps) == 2
     assert _merge_calls(s) == [("pr", "merge", "42", "--merge")]
+
+
+class FlakyServer(FakeServer):
+    """Fails the first `failures` gh calls, as during a network outage."""
+
+    def __init__(self, prs, failures, **kw):
+        super().__init__(prs, **kw)
+        self.failures = failures
+
+    def _maybe_fail(self):
+        if self.failures > 0:
+            self.failures -= 1
+            raise pr.CmdError("gh pr view 42 failed (exit 1): dial tcp: no route to host")
+
+    def gh_json(self, argv, fields):
+        if argv[:2] == ["pr", "view"]:
+            self._maybe_fail()
+        return super().gh_json(argv, fields)
+
+
+def test_automerge_retries_after_gh_failure(monkeypatch, capsys):
+    s = FlakyServer([FakePR(number=42, head="feat")], failures=2)
+    install_server(monkeypatch, s)
+    sleeps = []
+    monkeypatch.setattr(pr.time, "sleep", sleeps.append)
+
+    pr.main(["automerge", "--single", "feat"])
+
+    assert _merge_calls(s) == [("pr", "merge", "42", "--merge")]
+    assert sleeps == [pr._AUTOMERGE_RETRY_SECONDS, pr._AUTOMERGE_RETRY_SECONDS]
+    err = capsys.readouterr().err
+    assert err.count("no route to host") == 2
+    assert f"retrying in {pr._AUTOMERGE_RETRY_SECONDS}s" in err
+
+
+def test_automerge_retries_when_is_behind_fetch_fails(monkeypatch, capsys):
+    s = FakeServer([FakePR(number=42, head="feat")])
+    install_server(monkeypatch, s)
+    attempts = []
+
+    def flaky_is_behind(base, head):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise pr.CmdError("git fetch --quiet origin main feat failed (exit 128)")
+        return False
+
+    monkeypatch.setattr(pr, "_is_behind", flaky_is_behind)
+    sleeps = []
+    monkeypatch.setattr(pr.time, "sleep", sleeps.append)
+
+    pr.main(["automerge", "feat"])
+
+    assert len(attempts) == 2 and sleeps == [pr._AUTOMERGE_RETRY_SECONDS]
+    assert "git fetch" in capsys.readouterr().err
+    assert s.prs[42].state == "MERGED"
+
+
+def test_automerge_lost_merge_reply_is_picked_up_next_poll(monkeypatch, capsys):
+    s = FakeServer([
+        FakePR(number=1, head="a"),
+        FakePR(number=2, head="b", base="a", title="[dep #1] B"),
+    ])
+    real_gh = s.gh
+
+    def gh_merge_then_timeout(*argv, **kw):
+        out = real_gh(*argv, **kw)
+        if argv[:2] == ("pr", "merge"):
+            raise pr.CmdError("gh pr merge 1 --merge failed (exit 1): timeout")
+        return out
+
+    install_server(monkeypatch, s, current_branch_name="a")
+    monkeypatch.setattr(pr, "gh", gh_merge_then_timeout)
+    sleeps = []
+    monkeypatch.setattr(pr.time, "sleep", sleeps.append)
+
+    pr.main(["automerge", "--single", "a"])
+
+    assert s.prs[1].state == "MERGED"
+    assert sleeps == [pr._AUTOMERGE_RETRY_SECONDS]
+    out, err = capsys.readouterr()
+    assert "timeout" in err and "PR #1 is already merged" in out
+    assert s.prs[2].title == "B"
+
+
+def test_automerge_still_dies_on_state_problems_without_retrying(monkeypatch):
+    s = FakeServer([FakePR(number=42, head="feat", state="CLOSED")])
+    install_server(monkeypatch, s)
+    sleeps = []
+    monkeypatch.setattr(pr.time, "sleep", sleeps.append)
+
+    with pytest.raises(SystemExit):
+        pr.main(["automerge", "--single", "feat"])
+
+    assert sleeps == []
+
