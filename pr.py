@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -605,6 +609,532 @@ def repo_instructions(tree: str) -> str:
     return "\n".join(blocks)
 
 
+def _fmt_duration(seconds: float) -> str:
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _fmt_tokens(n) -> str:
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _num(value):
+    """A JSON number, or 0 for anything else (missing keys, strings, bools)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
+
+
+def _dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _blocks(message: dict) -> list[dict]:
+    content = message.get("content")
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _tool_label(block: dict, limit: int = 48) -> str:
+    """`name: detail` for a tool_use block, e.g. `Bash: gh pr diff 42`."""
+    inp = _dict(block.get("input"))
+    name = str(block.get("name") or "?")
+    for key in ("command", "description", "file_path", "pattern", "prompt"):
+        value = inp.get(key)
+        if isinstance(value, str) and value.strip():
+            return _truncate(f"{name}: {value}", limit)
+    return _truncate(name, limit)
+
+
+def _result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return ""
+
+
+def _decode_event(line: str) -> dict | None:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _model_usage_totals(result: dict | None) -> dict | None:
+    """Sum the result event's per-model usage, or None when it is absent."""
+    usage = (result or {}).get("modelUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    keys = {
+        "input": "inputTokens",
+        "output": "outputTokens",
+        "cache_read": "cacheReadInputTokens",
+        "cache_write": "cacheCreationInputTokens",
+        "cost": "costUSD",
+    }
+    totals = {name: 0 for name in keys}
+    for per_model in usage.values():
+        if not isinstance(per_model, dict):
+            continue
+        for name, key in keys.items():
+            totals[name] += _num(per_model.get(key))
+    return totals
+
+
+# Claude buffers everything a forked slash command (the review skill) does and
+# replays it when the fork ends, so the event stream shows nothing live. Hooks
+# fire in real time, including inside forks and subagents: these append one
+# trimmed JSON line per event to a file that the stream loop polls.
+_HOOK_EVENTS = ("PreToolUse", "SubagentStart", "SubagentStop")
+_HOOK_SCRIPT = (
+    "import json, sys\n"
+    "d = json.load(sys.stdin)\n"
+    "i = d.get('tool_input')\n"
+    "o = {k: d.get(k) for k in ('hook_event_name', 'tool_name', 'tool_use_id', 'agent_type', 'agent_id')}\n"
+    "o['tool_input'] = {k: v[:200] if isinstance(v, str) else v for k, v in i.items()} if isinstance(i, dict) else {}\n"
+    "with open(sys.argv[1], 'a') as f:\n"
+    "    f.write(json.dumps(o) + '\\n')\n"
+)
+
+
+def _hook_settings(path: str) -> str:
+    """Settings JSON installing hooks that append one JSON line per event to `path`."""
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(_HOOK_SCRIPT)} {shlex.quote(path)}"
+    hooks = {name: [{"hooks": [{"type": "command", "command": command}]}] for name in _HOOK_EVENTS}
+    hooks["PreToolUse"][0]["matcher"] = ""
+    return json.dumps({"hooks": hooks})
+
+
+def _drain_lines(fh) -> list[str]:
+    """Complete lines appended to a file since the last call."""
+    lines = []
+    while True:
+        pos = fh.tell()
+        line = fh.readline()
+        if not line:
+            return lines
+        if not line.endswith(b"\n"):
+            fh.seek(pos)
+            return lines
+        lines.append(line.decode("utf-8", "replace"))
+
+
+# Milestones in claude's debug log. Unlike the event stream, the log is written
+# as things happen, so it shows what a forked review is doing right now.
+_LOG_API_REQUEST = re.compile(r"\[API REQUEST\] /v1/messages")
+_LOG_FIRST_BYTE = re.compile(r"\[API:timing\] first byte after (\d+)ms")
+_LOG_TOOL_DONE = re.compile(r"tool_dispatch_end tool=(\S+) .*durationMs=(\d+)")
+
+
+def _drain_hook_file(fh) -> list[dict]:
+    """Complete JSON records appended to the hook file since the last call."""
+    events = [_decode_event(line) for line in _drain_lines(fh)]
+    return [e for e in events if e is not None]
+
+
+def _denial_labels(result: dict | None) -> list[str]:
+    labels = []
+    for denial in (result or {}).get("permission_denials") or []:
+        if isinstance(denial, dict):
+            labels.append(_tool_label({"name": denial.get("tool_name"), "input": denial.get("tool_input")}))
+    return labels
+
+
+class ReviewProgress:
+    """Counters and rendering for one claude review run, fed stream-json events."""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._start = clock()
+        self.api_calls = 0
+        self.tool_calls = 0
+        # Input-side tokens (input + cache read + cache write) summed over calls,
+        # and the same figure for the latest call. Output tokens from events are
+        # only a lower bound; the result event's modelUsage has the real totals.
+        # Api and token events from a forked slash command only arrive when it
+        # finishes; tool calls and agents are counted live from hook events.
+        self.tokens_in = 0
+        self.output_tokens = 0
+        self.context_tokens = 0
+        self.running_agents: dict[str, str] = {}
+        self.agents_started = 0
+        self.last_tool = ""
+        self.last_task = ""
+        self.model = ""
+        self.result: dict | None = None
+        self.updates = 0
+        # Live figures from the debug log: every line written, each API request
+        # started, and the current phase with the time it began.
+        self.log_lines = 0
+        self.api_requests = 0
+        self.phase = "starting"
+        self._phase_since = self._start
+        self._seen_message_ids: set[str] = set()
+        self._seen_tool_ids: set[str] = set()
+        self._task_descriptions: dict[str, str] = {}
+
+    def elapsed(self) -> float:
+        return self._clock() - self._start
+
+    def _stamp(self, text: str) -> str:
+        return f"{_fmt_duration(self.elapsed())}  {text}"
+
+    def _set_phase(self, phase: str):
+        self.phase = phase
+        self._phase_since = self._clock()
+
+    def phase_text(self) -> str:
+        return f"{self.phase} {_fmt_duration(self._clock() - self._phase_since)}"
+
+    def handle_log_line(self, line: str) -> list[str]:
+        """Update the live counters from one debug-log line; return verbose lines for milestones."""
+        self.log_lines += 1
+        if _LOG_API_REQUEST.search(line):
+            self.api_requests += 1
+            self._set_phase("waiting for model")
+            self.updates += 1
+            return [self._stamp(f"api request #{self.api_requests}")]
+        m = _LOG_FIRST_BYTE.search(line)
+        if m:
+            self._set_phase("model responding")
+            self.updates += 1
+            return [self._stamp(f"model responding  (first byte after {int(m.group(1)) / 1000:.1f}s)")]
+        m = _LOG_TOOL_DONE.search(line)
+        if m:
+            self._set_phase("thinking")
+            self.updates += 1
+            return [self._stamp(f"tool done  {m.group(1)} in {int(m.group(2)) / 1000:.1f}s")]
+        return []
+
+    def handle(self, event: dict) -> list[str]:
+        """Update counters from one event; return the lines for verbose output."""
+        kind = event.get("type")
+        if "hook_event_name" in event:
+            lines = self._handle_hook(event)
+        elif kind == "assistant":
+            lines = self._handle_assistant(_dict(event.get("message")))
+        elif kind == "user":
+            lines = self._handle_user(_dict(event.get("message")))
+        elif kind == "system":
+            lines = self._handle_system(event)
+        elif kind == "result":
+            self.result = event
+            line = f"result {event.get('subtype') or '?'}"
+            cost = event.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                line += f"  cost ${cost:.2f}"
+            lines = [self._stamp(line)]
+        else:
+            lines = []
+        if lines:
+            self.updates += 1
+        return lines
+
+    def _handle_assistant(self, message: dict) -> list[str]:
+        lines = []
+        msg_id = message.get("id")
+        if not msg_id or msg_id not in self._seen_message_ids:
+            if msg_id:
+                self._seen_message_ids.add(msg_id)
+            usage = _dict(message.get("usage"))
+            context = sum(
+                _num(usage.get(k))
+                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            )
+            output = _num(usage.get("output_tokens"))
+            # Synthetic events (e.g. the forwarded final answer) carry zero usage.
+            if context or output:
+                self.api_calls += 1
+                self.tokens_in += context
+                self.output_tokens += output
+                self.context_tokens = context
+                lines.append(
+                    self._stamp(f"api#{self.api_calls}  ctx {_fmt_tokens(context)}  in {_fmt_tokens(self.tokens_in)}")
+                )
+        for block in _blocks(message):
+            if block.get("type") == "tool_use":
+                lines += self._tool_call(block, block.get("id"))
+        return lines
+
+    def _tool_call(self, block: dict, tool_id) -> list[str]:
+        """Count a tool call once, whether it arrives as a hook or a replayed message."""
+        if tool_id:
+            if tool_id in self._seen_tool_ids:
+                return []
+            self._seen_tool_ids.add(str(tool_id))
+        self.tool_calls += 1
+        self.last_tool = _tool_label(block)
+        return [self._stamp(f"tool#{self.tool_calls}  {self.last_tool}")]
+
+    def _handle_hook(self, event: dict) -> list[str]:
+        name = event.get("hook_event_name")
+        agent_id = str(event.get("agent_id") or "")
+        agent = str(event.get("agent_type") or "agent")
+        if name == "PreToolUse":
+            block = {"name": event.get("tool_name"), "input": event.get("tool_input")}
+            self._set_phase(f"running {event.get('tool_name') or 'tool'}")
+            return self._tool_call(block, event.get("tool_use_id"))
+        if name == "SubagentStart":
+            self.running_agents[agent_id] = agent
+            self.agents_started += 1
+            self.last_task = f"agent {agent}"
+            return [self._stamp(f"agent start  {agent}  ({len(self.running_agents)} running)")]
+        if name == "SubagentStop":
+            self.running_agents.pop(agent_id, None)
+            self.last_task = f"agent {agent} done"
+            return [self._stamp(f"agent stop  {agent}  ({len(self.running_agents)} running)")]
+        return []
+
+    def _handle_user(self, message: dict) -> list[str]:
+        lines = []
+        for block in _blocks(message):
+            if block.get("type") == "tool_result" and block.get("is_error"):
+                lines.append(self._stamp(f"tool error  {_truncate(_result_text(block.get('content')), 80)}"))
+        return lines
+
+    def _handle_system(self, event: dict) -> list[str]:
+        subtype = event.get("subtype")
+        if subtype == "init":
+            self.model = str(event.get("model") or "")
+            return [self._stamp(f"init  model={self.model or '?'}  mode={event.get('permissionMode') or '?'}")]
+        if subtype == "task_started":
+            if event.get("task_type", "local_agent") != "local_agent":
+                return []
+            task_id = str(event.get("task_id") or "")
+            desc = _truncate(str(event.get("description") or "task"), 60)
+            self._task_descriptions[task_id] = desc
+            self.last_task = desc
+            agent = event.get("subagent_type")
+            return [self._stamp(f"task start  {desc}" + (f" ({agent})" if agent else ""))]
+        if subtype == "task_notification":
+            desc = self._task_descriptions.pop(str(event.get("task_id") or ""), None)
+            if desc is None:
+                return []
+            summary = _truncate(str(event.get("summary") or ""), 60)
+            status = event.get("status") or "stopped"
+            if summary == desc:
+                summary = ""
+            self.last_task = f"{desc} {status}"
+            return [self._stamp(f"task {status}  {desc}" + (f": {summary}" if summary else ""))]
+        return []
+
+    def status_line(self, width: int) -> str:
+        parts = [
+            _fmt_duration(self.elapsed()),
+            self.phase_text(),
+            f"api {max(self.api_requests, self.api_calls)}",
+            f"tools {self.tool_calls}",
+            f"agents {len(self.running_agents)}",
+            f"log {_fmt_tokens(self.log_lines)}",
+        ]
+        if self.api_calls:
+            parts += [f"ctx {_fmt_tokens(self.context_tokens)}", f"in {_fmt_tokens(self.tokens_in)}"]
+        if self.last_tool or self.last_task:
+            parts.append(self.last_tool or self.last_task)
+        return "  ".join(parts)[: max(width, 0)]
+
+    def summary(self) -> str:
+        duration = _fmt_duration(self.elapsed())
+        api = max(self.api_requests, self.api_calls)
+        counts = f"{api} api calls, {self.tool_calls} tool calls, {self.agents_started} agents"
+        totals = _model_usage_totals(self.result)
+        if totals is not None:
+            tokens = (
+                f"tokens in {_fmt_tokens(totals['input'])}, out {_fmt_tokens(totals['output'])}, "
+                f"cache read {_fmt_tokens(totals['cache_read'])}, cache write {_fmt_tokens(totals['cache_write'])}"
+            )
+            cost = totals["cost"]
+        else:
+            tokens = f"tokens (from events) in {_fmt_tokens(self.tokens_in)}, out {_fmt_tokens(self.output_tokens)}"
+            cost = (self.result or {}).get("total_cost_usd")
+        cost_text = f"cost ${cost:.2f}" if isinstance(cost, (int, float)) else "cost n/a"
+        if self.result is None:
+            return f"review ended in {duration} without a result: {counts}; {tokens}; {cost_text}"
+        line = f"review done in {duration}: {counts}; {tokens}; {cost_text}"
+        denials = _denial_labels(self.result)
+        if denials:
+            noun = "permission denial" if len(denials) == 1 else "permission denials"
+            line += f"; {len(denials)} {noun}: {', '.join(denials)}"
+        return line
+
+    def review_text(self) -> str:
+        text = (self.result or {}).get("result")
+        return text if isinstance(text, str) else ""
+
+    def failure(self) -> str | None:
+        """Why the run produced no usable review, or None if it succeeded."""
+        if self.result is None:
+            return "stream ended without a result event"
+        subtype = self.result.get("subtype") or "unknown"
+        if self.result.get("is_error"):
+            return f"is_error: {_truncate(self.review_text() or subtype, 200)}"
+        if subtype != "success":
+            return subtype
+        return None
+
+
+class ReviewDisplay:
+    """Progress on stderr: a status line redrawn in place, or a line per event when verbose."""
+
+    def __init__(self, out=None, verbose: bool = False, clock=time.monotonic):
+        self._out = out or sys.stderr
+        self._verbose = verbose
+        self._tty = self._out.isatty()
+        self._clock = clock
+        self._last_draw = clock()
+        self._last_updates = 0
+        self._status_shown = False
+
+    def _width(self) -> int:
+        try:
+            columns = os.get_terminal_size(self._out.fileno()).columns
+        except (OSError, ValueError, AttributeError):
+            columns = 0
+        return columns - 1 if columns > 1 else 99
+
+    def log(self, lines: list[str]):
+        if not self._verbose or not lines:
+            return
+        for line in lines:
+            print(line, file=self._out)
+        self._out.flush()
+        self._last_draw = self._clock()
+
+    def tick(self, progress: ReviewProgress):
+        now = self._clock()
+        if self._verbose:
+            # A heartbeat line every 15s of silence, so a quiet model turn is
+            # distinguishable from a hang.
+            if now - self._last_draw >= 15:
+                print(progress.status_line(200), file=self._out)
+                self._out.flush()
+                self._last_draw = now
+            return
+        if self._tty:
+            if now - self._last_draw < 0.2 and self._status_shown:
+                return
+            self._out.write("\r\033[2K" + progress.status_line(self._width()))
+            self._status_shown = True
+        else:
+            # Without a terminal, emit a plain line whenever something happened
+            # or every 30s, so a redirected stderr stays readable.
+            if progress.updates == self._last_updates and now - self._last_draw < 30:
+                return
+            print(progress.status_line(200), file=self._out)
+            self._last_updates = progress.updates
+        self._out.flush()
+        self._last_draw = now
+
+    def finish(self):
+        if self._status_shown:
+            self._out.write("\r\033[2K")
+            self._out.flush()
+            self._status_shown = False
+
+
+def _run_claude_stream(cmd: list[str], prompt: str, cwd: str, display: ReviewDisplay) -> tuple[int, ReviewProgress]:
+    """Run claude with stream-json output and live hooks, feeding every event to the display."""
+    progress = ReviewProgress()
+    hook_fd, hook_path = tempfile.mkstemp(prefix="pr-review-hooks-", suffix=".jsonl")
+    os.close(hook_fd)
+    log_fd, log_path = tempfile.mkstemp(prefix="pr-review-debug-", suffix=".log")
+    os.close(log_fd)
+    cmd = [*cmd, "--settings", _hook_settings(hook_path), "--debug-file", log_path]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, cwd=cwd)
+    except FileNotFoundError:
+        os.unlink(hook_path)
+        os.unlink(log_path)
+        die(f"{cmd[0]} not found on PATH")
+    lines: queue.Queue = queue.Queue()
+
+    # A reader thread lets the main loop wake up once a second to advance the
+    # clock while claude is silent (long tool calls, thinking subagents).
+    def pump():
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    transcript_path = os.environ.get("PR_CLAUDE_TRANSCRIPT")
+    transcript = open(transcript_path, "a") if transcript_path else None
+    hook_fh = open(hook_path, "rb")
+    log_fh = open(log_path, "rb")
+
+    def feed(event: dict):
+        display.log(progress.handle(event))
+        display.tick(progress)
+
+    def poll_files():
+        for raw in _drain_hook_file(hook_fh):
+            feed(raw)
+        for raw in _drain_lines(log_fh):
+            display.log(progress.handle_log_line(raw))
+        display.tick(progress)
+
+    try:
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        while True:
+            poll_files()
+            try:
+                line = lines.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            if transcript:
+                transcript.write(line)
+            event = _decode_event(line)
+            if event is not None:
+                feed(event)
+        rc = proc.wait()
+        poll_files()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        display.finish()
+        die("review interrupted", code=130)
+    finally:
+        if transcript:
+            transcript.close()
+        hook_fh.close()
+        log_fh.close()
+        for path in (hook_path, log_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    display.finish()
+    return rc, progress
+
+
 def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
     entry = rs["branches"].get(branch)
     parent = (entry or {}).get("depends_on") or default_branch()
@@ -643,7 +1173,7 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
         print(f"no diff for {source}")
         return
 
-    print(f"reviewing {source}")
+    print(f"reviewing {source}", file=sys.stderr)
 
     prior_review = (entry or {}).get("last_review")
     context_block = ""
@@ -696,28 +1226,32 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
     # regardless of which subdirectory `pr review` was invoked from.
     # Plan mode keeps the session read-only while still allowing the git and
     # gh commands the skill needs; anything that would prompt is denied.
-    # Capture stdout so the review can be persisted; stderr still streams.
-    proc = subprocess.run(
-        [
-            "claude",
-            "-p",
-            "--permission-mode",
-            "plan",
-            "--permission-prompts",
-            "none",
-            "--allowedTools",
-            "Bash(gh pr diff:*),Bash(gh pr view:*)",
-            "--strict-mcp-config",
-        ],
-        input=prompt,
-        text=True,
-        stdout=subprocess.PIPE,
-        cwd=tree,
-    )
-    if proc.returncode != 0:
-        die(f"claude exited with code {proc.returncode}", code=proc.returncode)
-
-    review_text = (proc.stdout or "").strip()
+    # stream-json on stdout drives the progress display and carries the final
+    # review; claude's own stderr still streams to the terminal.
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none",
+        "--allowedTools",
+        "Bash(gh pr diff:*),Bash(gh pr view:*)",
+        "--strict-mcp-config",
+    ]
+    rc, progress = _run_claude_stream(cmd, prompt, tree, ReviewDisplay(verbose=args.verbose))
+    print(progress.summary(), file=sys.stderr)
+    if rc != 0:
+        die(f"claude exited with code {rc}", code=rc)
+    reason = progress.failure()
+    if reason:
+        die(f"claude review failed: {reason}")
+    review_text = progress.review_text().strip()
+    if not review_text:
+        die("claude returned an empty review")
     print(review_text)
 
     if entry is not None:
@@ -1026,8 +1560,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--level",
         choices=["low", "medium", "high", "xhigh", "max"],
-        default="high",
-        help="code-review effort: higher levels report more findings and run more reviewer agents (default: high)",
+        default="medium",
+        help="code-review effort: higher levels report more findings but run more reviewer agents and take "
+        "much longer (default: medium)",
+    )
+    r.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="log every claude event (tool calls, agents, token usage) to stderr instead of the status line",
     )
 
     pr_post = sub.add_parser("post-review", help="post a branch's stored review as a PR comment")

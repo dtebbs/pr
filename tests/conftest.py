@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 FAKE_GH_DIR = Path(__file__).resolve().parent / "fake_gh"
+FAKE_CLAUDE_DIR = Path(__file__).resolve().parent / "fake_claude"
 
 
 def _git(cwd, *args):
@@ -62,3 +64,21 @@ def isolated_state(tmp_path, monkeypatch):
     p = tmp_path / "pr.json"
     monkeypatch.setattr("pr.STATE_PATH", p)
     return p
+
+
+@pytest.fixture
+def fake_claude_on_path(monkeypatch, tmp_path):
+    """Put the `claude` stub on PATH. Returns a function that sets the stream-json
+    events it replays and its exit code, and returns the path of its argv/prompt log."""
+    monkeypatch.setenv("PATH", f"{FAKE_CLAUDE_DIR}{os.pathsep}{os.environ['PATH']}")
+    log = tmp_path / "claude-log.json"
+    monkeypatch.setenv("PR_TEST_CLAUDE_LOG", str(log))
+
+    def set_transcript(events, exit_code=0):
+        transcript = tmp_path / "claude-transcript.jsonl"
+        transcript.write_text("".join(json.dumps(e) + "\n" for e in events))
+        monkeypatch.setenv("PR_TEST_CLAUDE_TRANSCRIPT", str(transcript))
+        monkeypatch.setenv("PR_TEST_CLAUDE_EXIT", str(exit_code))
+        return log
+
+    return set_transcript
