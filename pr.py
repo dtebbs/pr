@@ -581,6 +581,12 @@ def cmd_update(args):
 
 def cmd_review(args):
     branches = args.branches or [current_branch()]
+    if args.interactive:
+        if len(branches) != 1:
+            die("--interactive works through one branch at a time")
+        current = current_branch()
+        if branches[0] != current:
+            die(f"check out {branches[0]} to work through its review (currently on {current})")
     state = load_state()
     tree = current_tree()
     rs = tree_state(state, tree)
@@ -1141,11 +1147,15 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
     pr_num = (entry or {}).get("pr")
 
     if args.show:
-        review = (entry or {}).get("last_review")
-        if review and review.strip():
-            print(review.strip())
-        else:
+        review_text = ((entry or {}).get("last_review") or "").strip()
+        if not review_text:
+            if args.interactive:
+                die(f"no stored review for branch {branch}; run `pr review` first")
             print(f"no stored review for branch {branch}")
+        elif args.interactive:
+            _interactive_review(tree, branch, parent, review_text)
+        else:
+            print(review_text)
         return
 
     # Pull the diff from the server so the review is independent of the local
@@ -1263,6 +1273,39 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
             "(run `pr branch` or `pr create` first)",
             file=sys.stderr,
         )
+    if args.interactive:
+        _interactive_review(tree, branch, parent, review_text)
+
+
+def _interactive_prompt(branch: str, parent: str, review_text: str) -> str:
+    diff_cmd = f"git diff --no-ext-diff origin/{parent}"
+    return (
+        f"I have just had branch `{branch}` reviewed against `origin/{parent}` and the findings "
+        "are listed below. I want to work through them with you one round at a time.\n\n"
+        "Keep a numbered checklist of the open findings. Each round I will fix or answer some "
+        "of them myself and then ask you to re-check. When I do:\n"
+        f"1. Re-read the current changes with `{diff_cmd}` (uncommitted edits included) and "
+        "verify each fix against the actual code, not my description of it. Tick a finding "
+        "off only when the fix is correct and complete; otherwise say what is still wrong.\n"
+        "2. Where I answered a finding instead of fixing it, judge the answer and tick it off "
+        "only if it holds.\n"
+        "3. Look for new bugs the fixes may have introduced, and add any to the list.\n"
+        "4. Finish with the remaining checklist.\n\n"
+        "Repeat until nothing is left. Do not edit files unless I ask you to.\n\n"
+        "Start by showing the checklist and asking what I have done so far.\n\n"
+        f"Findings:\n{review_text}\n"
+    )
+
+
+def _interactive_review(tree: str, branch: str, parent: str, review_text: str):
+    """Replace this process with an interactive claude session that works through the findings."""
+    git("fetch", "--quiet", "origin", parent, capture=False)
+    print(f"starting interactive session for branch {branch} (base origin/{parent})", file=sys.stderr)
+    os.chdir(tree)
+    try:
+        os.execvp("claude", ["claude", "--name", f"review {branch}", _interactive_prompt(branch, parent, review_text)])
+    except FileNotFoundError:
+        die("claude not found on PATH")
 
 
 def cmd_post_review(args):
@@ -1580,6 +1623,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="log every claude event (tool calls, agents, token usage) to stderr instead of the status line",
+    )
+    r.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="then open an interactive claude session to work through the findings until all are "
+        "resolved (with --show, use the stored review instead of running a new one)",
     )
 
     pr_post = sub.add_parser("post-review", help="post a branch's stored review as a PR comment")

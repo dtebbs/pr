@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -122,3 +124,75 @@ def test_review_without_result_event_fails(tracked_b, fake_claude_on_path, capfd
     assert "review ended in " in err and "without a result" in err
     assert "stream ended without a result event" in err
     assert "last_review" not in _branches(tracked_b)["b"]
+
+
+
+@pytest.fixture
+def captured_exec(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pr.os, "execvp", lambda file, argv: calls.append((file, argv)))
+    return calls
+
+
+def _checkout(git_sandbox, branch):
+    subprocess.run(["git", "checkout", branch], cwd=git_sandbox, check=True, capture_output=True)
+
+
+def test_interactive_with_show_uses_stored_review(git_sandbox, isolated_state, captured_exec, capfd):
+    _seed(isolated_state, {"b": {"pr": None, "depends_on": "a", "status": "no-pr", "last_review": "- f:1 wrong"}})
+    _checkout(git_sandbox, "b")
+
+    pr.main(["review", "--show", "-i"])
+
+    (call,) = captured_exec
+    assert call[0] == "claude"
+    assert call[1][:3] == ["claude", "--name", "review b"]
+    prompt = call[1][3]
+    assert "branch `b` reviewed against `origin/a`" in prompt
+    assert "git diff --no-ext-diff origin/a" in prompt
+    assert "numbered checklist" in prompt and "new bugs" in prompt
+    assert prompt.endswith("Findings:\n- f:1 wrong\n")
+    out, err = capfd.readouterr()
+    assert "- f:1 wrong" not in out
+    assert "starting interactive session for branch b" in err
+    assert os.getcwd() == pr.current_tree()
+
+
+def test_interactive_after_fresh_review(tracked_b, git_sandbox, fake_claude_on_path, captured_exec, capfd):
+    fake_claude_on_path(EVENTS + [RESULT])
+    _checkout(git_sandbox, "b")
+
+    pr.main(["review", "-i"])
+
+    assert _branches(tracked_b)["b"]["last_review"] == REVIEW
+    (call,) = captured_exec
+    assert REVIEW in call[1][3]
+    assert capfd.readouterr().out.strip() == REVIEW
+
+
+def test_interactive_requires_stored_review_with_show(tracked_b, git_sandbox, captured_exec, capfd):
+    _checkout(git_sandbox, "b")
+
+    with pytest.raises(SystemExit):
+        pr.main(["review", "--show", "-i"])
+
+    assert captured_exec == []
+    assert "run `pr review` first" in capfd.readouterr().err
+
+
+def test_interactive_requires_checked_out_branch(git_sandbox, isolated_state, captured_exec, capfd):
+    _seed(isolated_state, {"b": {"pr": None, "depends_on": "a", "status": "no-pr", "last_review": "x"}})
+
+    with pytest.raises(SystemExit):
+        pr.main(["review", "--show", "-i", "b"])
+
+    assert captured_exec == []
+    assert "check out b" in capfd.readouterr().err
+
+
+def test_interactive_rejects_multiple_branches(git_sandbox, isolated_state, captured_exec, capfd):
+    with pytest.raises(SystemExit):
+        pr.main(["review", "-i", "a", "b"])
+
+    assert captured_exec == []
+    assert "one branch at a time" in capfd.readouterr().err
