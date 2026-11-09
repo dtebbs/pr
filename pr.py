@@ -513,6 +513,81 @@ def cmd_target(args):
         print("note: branch needs rebase onto new dep — run `pr rebase`")
 
 
+def _is_ancestor(commit: str, ref: str) -> bool:
+    proc = run(["git", "merge-base", "--is-ancestor", commit, ref], check=False)
+    if proc.returncode in (0, 1):
+        return proc.returncode == 0
+    raise CmdError(
+        f"git merge-base --is-ancestor {commit} {ref} exited {proc.returncode}: {(proc.stderr or '').strip()}"
+    )
+
+
+def cmd_split(args):
+    """Split the current PR at a commit: branch off there, open a PR for the new
+    branch on the current dep, and make the current PR depend on it."""
+    state = load_state()
+    tree = current_tree()
+    rs = tree_state(state, tree)
+    cur = current_branch()
+    entry = rs["branches"].get(cur)
+    if not entry or entry.get("pr") is None:
+        die(f"current branch {cur} has no PR; run `pr create` first")
+    if entry.get("status") != "open":
+        die(f"PR #{entry['pr']} is not open (status={entry['status']})")
+    if args.name in rs["branches"]:
+        die(f"branch {args.name} already tracked in state")
+    if run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.name}"], check=False).returncode == 0:
+        die(f"branch {args.name} already exists")
+
+    db = default_branch()
+    dep = entry.get("depends_on")
+    base = dep if dep is not None else db
+    dep_pr = None
+    if dep is not None:
+        dep_entry = rs["branches"].get(dep)
+        if not dep_entry or dep_entry.get("pr") is None or dep_entry.get("status") != "open":
+            die(f"dep branch {dep!r} has no open PR")
+        dep_pr = dep_entry["pr"]
+
+    try:
+        sha = git("rev-parse", "--verify", "--quiet", f"{args.commit}^{{commit}}")
+    except CmdError:
+        die(f"unknown commit {args.commit!r}")
+    git("fetch", "--quiet", "origin", base, capture=False)
+    if not _is_ancestor(sha, cur):
+        die(f"commit {args.commit} is not on branch {cur}")
+    if _is_ancestor(sha, f"origin/{base}"):
+        die(f"commit {args.commit} is already in {base}; nothing to split off")
+    if sha == git("rev-parse", cur):
+        die(f"commit {args.commit} is the tip of {cur}; splitting there would leave this PR empty")
+
+    title = _format_title(args.message or git("log", "-1", "--format=%s", sha), dep_pr)
+    git("branch", args.name, sha)
+    git("push", "-u", "origin", args.name, capture=False)
+    create_args = ["pr", "create", "--head", args.name, "--base", base, "--title", title, "--body", ""]
+    if not args.ready:
+        create_args.append("--draft")
+    out = gh(*create_args)
+    m = re.search(r"/pull/(\d+)", out)
+    if not m:
+        die(f"could not parse PR number from gh pr create output: {out!r}")
+    new_pr = int(m.group(1))
+    rs["branches"][args.name] = {
+        "pr": new_pr,
+        "depends_on": dep,
+        "status": "open",
+        "draft": not args.ready,
+    }
+    save_state(state)
+    print(f"created PR #{new_pr} for {args.name}: {title}")
+
+    gh("pr", "edit", str(entry["pr"]), "--base", args.name)
+    _apply_title_prefix(entry["pr"], new_pr)
+    entry["depends_on"] = args.name
+    save_state(state)
+    print(f"PR #{entry['pr']} now depends on {args.name} (#{new_pr})")
+
+
 def cmd_rebase(args):
     state = load_state()
     tree = current_tree()
@@ -1409,18 +1484,7 @@ def _is_behind(base: str, head: str) -> bool:
     Independent of branch protection (mergeStateStatus only reports BEHIND
     when 'Require branches to be up to date' is enabled)."""
     git("fetch", "--quiet", "origin", base, head, capture=False)
-    proc = run(
-        ["git", "merge-base", "--is-ancestor", f"origin/{base}", f"origin/{head}"],
-        check=False,
-    )
-    if proc.returncode == 0:
-        return False
-    if proc.returncode == 1:
-        return True
-    raise CmdError(
-        f"git merge-base --is-ancestor origin/{base} origin/{head} exited "
-        f"{proc.returncode}: {(proc.stderr or '').strip()}"
-    )
+    return not _is_ancestor(f"origin/{base}", f"origin/{head}")
 
 
 def _strip_dep_prefix_on_dependents(merged_head: str):
@@ -1597,6 +1661,15 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("branch", nargs="?")
     t.add_argument("--main", action="store_true")
 
+    sp = sub.add_parser(
+        "split",
+        help="split the current PR at a commit: new branch and PR on the current dep, with this PR moved on top",
+    )
+    sp.add_argument("commit", help="commit in the current PR that becomes the tip of the new branch")
+    sp.add_argument("name", help="name for the new intermediate branch")
+    sp.add_argument("-m", "--message", help="title for the new PR (default: the commit's subject line)")
+    sp.add_argument("--ready", action="store_true", help="create the new PR as ready (default is draft)")
+
     sub.add_parser("rebase", help="rebase current branch onto its dep")
 
     d = sub.add_parser("diff", help="git diff a branch against its base (flags after `--` go to git diff)")
@@ -1670,6 +1743,7 @@ def main(argv: list[str] | None = None):
         "create": cmd_create,
         "fetch": cmd_fetch,
         "target": cmd_target,
+        "split": cmd_split,
         "rebase": cmd_rebase,
         "diff": cmd_diff,
         "checkout": cmd_checkout,
