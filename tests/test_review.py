@@ -67,6 +67,7 @@ def test_review_streams_progress_and_stores_review(tracked_b, fake_claude_on_pat
     assert "--permission-mode" in argv and "plan" in argv
     assert recorded["prompt"].splitlines()[0] == "/code-review medium origin/b --max-findings all"
     assert "git diff --no-ext-diff origin/a...origin/b" in recorded["prompt"]
+    assert "Wrap every line, bullets included, at 80 characters." in recorded["prompt"]
 
 
 def test_review_verbose_logs_events(tracked_b, fake_claude_on_path, capfd):
@@ -151,6 +152,8 @@ def test_interactive_with_show_uses_stored_review(git_sandbox, isolated_state, c
     assert "branch `b` reviewed against `origin/a`" in prompt
     assert "git diff --no-ext-diff origin/a" in prompt
     assert "numbered checklist" in prompt and "new bugs" in prompt
+    assert "never renumber, switch to letters, or reuse a number" in prompt
+    assert "3. (PZStateDelta stale comment) awaiting your decision" in prompt
     assert prompt.endswith("Findings:\n- f:1 wrong\n")
     out, err = capfd.readouterr()
     assert "- f:1 wrong" not in out

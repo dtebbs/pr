@@ -617,6 +617,39 @@ def cmd_diff(args):
         sys.exit(rc)
 
 
+def cmd_commits(args):
+    state = load_state()
+    rs = tree_state(state, current_tree())
+    target = args.target or current_branch()
+    if target.isdigit():
+        matches = [b for b, e in rs["branches"].items() if e.get("pr") == int(target)]
+        if not matches:
+            die(f"no tracked branch for PR #{target}")
+        branch = matches[0]
+    else:
+        branch = target
+    entry = rs["branches"].get(branch)
+    parent = (entry or {}).get("depends_on") or default_branch()
+    # Two-dot: the branch's own commits, newest first.
+    lines = git("log", "--format=   %h %s", f"origin/{parent}..{branch}").splitlines()
+    for line in lines:
+        print(line)
+    if args.no_copy:
+        return
+    sys.stdout.flush()
+    _copy_to_clipboard("".join(line + "\n" for line in lines))
+    print("(copied to clipboard)", file=sys.stderr)
+
+
+def _copy_to_clipboard(text: str):
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+    except FileNotFoundError:
+        die("pbcopy not found; pass --no-copy to skip the clipboard")
+    except subprocess.CalledProcessError as e:
+        die(f"pbcopy failed (exit {e.returncode})")
+
+
 def cmd_checkout(args):
     target = args.target
     if target.isdigit():
@@ -1304,7 +1337,7 @@ def _review_branch(state: dict, rs: dict, tree: str, branch: str, args):
         "for posting as a PR comment: one bullet per finding giving file:line, "
         "what is wrong, how it fails, and your confidence, followed by a short "
         "list of what you checked and found clean. Do not reply with only a "
-        "one-line verdict.\n"
+        "one-line verdict. Wrap every line, bullets included, at 80 characters.\n"
     )
 
     # Run from the repo root so claude also picks up CLAUDE.md on its own,
@@ -1357,15 +1390,24 @@ def _interactive_prompt(branch: str, parent: str, review_text: str) -> str:
     return (
         f"I have just had branch `{branch}` reviewed against `origin/{parent}` and the findings "
         "are listed below. I want to work through them with you one round at a time.\n\n"
-        "Keep a numbered checklist of the open findings. Each round I will fix or answer some "
-        "of them myself and then ask you to re-check. When I do:\n"
+        "Keep a numbered checklist of the open findings. Number them 1, 2, 3, ... once, in "
+        "the order given below, and keep those numbers for the whole session: never "
+        "renumber, switch to letters, or reuse a number. A new finding gets the next unused "
+        "number. Whenever you list the checklist, give each item as its number, a short "
+        "parenthesised reminder of the issue (file or symbol plus a few words), and its "
+        "state, for example:\n"
+        "  3. (PZStateDelta stale comment) awaiting your decision\n"
+        "  7. (parse_ts rejects Z suffix) fixed\n"
+        "I will refer to findings by these numbers, so they must not change.\n\n"
+        "Each round I will fix or answer some of the findings myself and then ask you to "
+        "re-check. When I do:\n"
         f"1. Re-read the current changes with `{diff_cmd}` (uncommitted edits included) and "
         "verify each fix against the actual code, not my description of it. Tick a finding "
         "off only when the fix is correct and complete; otherwise say what is still wrong.\n"
         "2. Where I answered a finding instead of fixing it, judge the answer and tick it off "
         "only if it holds.\n"
         "3. Look for new bugs the fixes may have introduced, and add any to the list.\n"
-        "4. Finish with the remaining checklist.\n\n"
+        "4. Finish with the remaining checklist in the format above.\n\n"
         "Repeat until nothing is left. Do not edit files unless I ask you to.\n\n"
         "Start by showing the checklist and asking what I have done so far.\n\n"
         f"Findings:\n{review_text}\n"
@@ -1675,6 +1717,10 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("diff", help="git diff a branch against its base (flags after `--` go to git diff)")
     d.add_argument("branch", nargs="?", help="branch to diff (defaults to current branch)")
 
+    cm = sub.add_parser("commits", help="list a PR's commits (abbreviated hash and subject) and copy the list to the clipboard")
+    cm.add_argument("target", nargs="?", help="branch name or PR number (defaults to current branch)")
+    cm.add_argument("--no-copy", action="store_true", help="only print the list; do not copy it to the clipboard")
+
     co = sub.add_parser("checkout", help="check out a branch or PR number")
     co.add_argument("target", help="branch name or PR number")
 
@@ -1746,6 +1792,7 @@ def main(argv: list[str] | None = None):
         "split": cmd_split,
         "rebase": cmd_rebase,
         "diff": cmd_diff,
+        "commits": cmd_commits,
         "checkout": cmd_checkout,
         "update": cmd_update,
         "review": cmd_review,
